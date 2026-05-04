@@ -1,0 +1,239 @@
+{
+  "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "triggers": {
+    "manual": {
+      "type": "Request",
+      "kind": "Http",
+      "inputs": {
+        "schema": {
+          "type": "object",
+          "properties": {
+            "feature_description": {
+              "type": "string",
+              "description": "The feature or scenario to generate test cases for"
+            },
+            "work_item_id": {
+              "type": "integer",
+              "description": "Optional Azure DevOps work item ID"
+            }
+          },
+          "required": ["feature_description"]
+        }
+      }
+    }
+  },
+  "actions": {
+    "Call_SmartCare_Bridge": {
+      "runAfter": {},
+      "type": "Http",
+      "inputs": {
+        "method": "POST",
+        "uri": "http://127.0.0.1:8010/bridge/power-automate",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "request_id": "@{utcNow('yyyyMMddHHmmss')}",
+          "feature_text": "@{triggerBody()?['feature_description']}",
+          "work_item_id": "@{triggerBody()?['work_item_id']}",
+          "mode": "mock"
+        }
+      }
+    },
+    "Parse_Bridge_Response": {
+      "runAfter": {
+        "Call_SmartCare_Bridge": ["Succeeded"]
+      },
+      "type": "ParseJson",
+      "inputs": {
+        "content": "@body('Call_SmartCare_Bridge')",
+        "schema": {
+          "type": "object",
+          "properties": {
+            "channel": {"type": "string"},
+            "status": {"type": "string"},
+            "summary": {"type": "string"},
+            "metrics": {
+              "type": "object",
+              "properties": {
+                "total_test_cases": {"type": "integer"},
+                "critical_tests": {"type": "integer"},
+                "high_tests": {"type": "integer"},
+                "estimated_minutes_saved": {"type": "integer"}
+              }
+            },
+            "test_cases_sample": {"type": "array"},
+            "compliance": {
+              "type": "object",
+              "properties": {
+                "hipaa_safe": {"type": "boolean"},
+                "phi_sanitized": {"type": "boolean"}
+              }
+            },
+            "request_id": {"type": "string"}
+          }
+        }
+      }
+    },
+    "Compose_Response_Card": {
+      "runAfter": {
+        "Parse_Bridge_Response": ["Succeeded"]
+      },
+      "type": "Compose",
+      "inputs": {
+        "type": "AdaptiveCard",
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "version": "1.4",
+        "body": [
+          {
+            "type": "Container",
+            "style": "emphasis",
+            "items": [
+              {
+                "type": "TextBlock",
+                "text": "✅ SmartCare QA Pack Generated",
+                "weight": "bolder",
+                "size": "large",
+                "color": "good"
+              }
+            ]
+          },
+          {
+            "type": "TextBlock",
+            "text": "@{body('Parse_Bridge_Response')['summary']}",
+            "wrap": true,
+            "spacing": "medium"
+          },
+          {
+            "type": "Container",
+            "separator": true,
+            "items": [
+              {
+                "type": "TextBlock",
+                "text": "📊 Metrics",
+                "weight": "bolder",
+                "size": "medium"
+              },
+              {
+                "type": "ColumnSet",
+                "columns": [
+                  {
+                    "width": "stretch",
+                    "items": [
+                      {
+                        "type": "TextBlock",
+                        "text": "Total Tests"
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "@{body('Parse_Bridge_Response')['metrics']['total_test_cases']}",
+                        "size": "large",
+                        "weight": "bolder"
+                      }
+                    ]
+                  },
+                  {
+                    "width": "stretch",
+                    "items": [
+                      {
+                        "type": "TextBlock",
+                        "text": "Critical"
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "@{body('Parse_Bridge_Response')['metrics']['critical_tests']}",
+                        "size": "large",
+                        "weight": "bolder"
+                      }
+                    ]
+                  },
+                  {
+                    "width": "stretch",
+                    "items": [
+                      {
+                        "type": "TextBlock",
+                        "text": "Time Saved"
+                      },
+                      {
+                        "type": "TextBlock",
+                        "text": "@{body('Parse_Bridge_Response')['metrics']['estimated_minutes_saved']} min",
+                        "size": "large",
+                        "weight": "bolder",
+                        "color": "good"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "separator": true,
+            "items": [
+              {
+                "type": "TextBlock",
+                "text": "🔒 Compliance Status",
+                "weight": "bolder",
+                "size": "medium"
+              },
+              {
+                "type": "TextBlock",
+                "text": "✓ HIPAA Safe: @{body('Parse_Bridge_Response')['compliance']['hipaa_safe']}",
+                "wrap": true
+              },
+              {
+                "type": "TextBlock",
+                "text": "✓ PHI Sanitized: @{body('Parse_Bridge_Response')['compliance']['phi_sanitized']}",
+                "wrap": true
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "separator": true,
+            "items": [
+              {
+                "type": "TextBlock",
+                "text": "📋 Sample Test Cases (first 3)",
+                "weight": "bolder",
+                "size": "medium"
+              },
+              {
+                "type": "TextBlock",
+                "text": "@{join(map(body('Parse_Bridge_Response')['test_cases_sample'], item => concat('• ', item['title'], ' [Priority: ', item['priority'], ']')), decodeUriComponent('%0A'))}",
+                "wrap": true,
+                "spacing": "small"
+              }
+            ]
+          },
+          {
+            "type": "Container",
+            "separator": true,
+            "items": [
+              {
+                "type": "TextBlock",
+                "text": "Request ID: @{body('Parse_Bridge_Response')['request_id']}",
+                "size": "small",
+                "isSubtle": true
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "Send_Response": {
+      "runAfter": {
+        "Compose_Response_Card": ["Succeeded"]
+      },
+      "type": "Response",
+      "inputs": {
+        "statusCode": 200,
+        "body": "@outputs('Compose_Response_Card')"
+      }
+    }
+  },
+  "outputs": {}
+}

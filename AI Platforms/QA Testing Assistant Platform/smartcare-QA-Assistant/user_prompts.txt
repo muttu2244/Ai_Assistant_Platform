@@ -1,0 +1,43 @@
+Use these in Free Text to test end-to-end behavior quickly.
+
+Exact ADO grounding + metadata
+Generate coverage gaps for ADO work item 79489. Use exact work item only.
+
+Requirement/test analysis with explicit ID
+Analyze requirement-to-test traceability for work item 640467 and list missing coverage.
+
+Defect-focused grounded query
+For ticket 640467, summarize linked defect risks and likely high-risk test areas.
+
+Search-based grounding (no ID)
+Find coverage gaps for inquiry details language and interpreter fields from ADO.
+
+Force clarification path
+Generate coverage gaps from ADO.
+(You should get a “provide ID or feature/module” style clarification if search is weak.)
+
+Generic non-ADO chat (control test)
+What is the difference between smoke testing and sanity testing?
+(Should go direct LLM, not ADO-grounded.)
+
+
+
+
+if context is weak, it asks for clarification instead of guessing, you said right ... give some example prompts for this
+
+1) Scenario 1: NO ID, NO KEYWORDS (Empty Request)
+User prompt: Generate coverage gaps from ADO.
+
+
+2) Scenario 2: KEYWORDS DON'T MATCH ANYTHING
+User prompt: Generate test cases for the purple xyz button validation flow.
+
+3)Scenario 3: AMBIGUOUS KEYWORDS (Multiple Equal Matches)
+User prompt: Generate 3 test cases for patient data.
+
+4) Scenario 4: VAGUE TESTING REQUEST (No ADO Signal)
+User prompt: Create a test pack.
+
+5) Scenario 5: GENERIC QA QUESTION (NO CLARIFICATION NEEDED)
+User prompt: What is the difference between smoke testing and sanity testing?
+

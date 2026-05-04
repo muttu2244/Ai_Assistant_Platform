@@ -1,0 +1,1 @@
+"""SmartCare QA Assistant package root."""
