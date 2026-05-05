@@ -21,6 +21,7 @@ from src.common.models.schemas import (
     SanitizedTestCase,
     SanitizedWorkItem,
 )
+from src.common.utils.helpers import strip_html
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +105,33 @@ def _dummy_for(original: str, label: str) -> str:
     return f"[{label}_{short}]"
 
 
+def _filter_overlapping_results(results: list[object]) -> list[object]:
+    """Keep the strongest non-overlapping detections to avoid double-masking corruption."""
+    ranked = sorted(
+        results,
+        key=lambda result: (
+            int(getattr(result, "start", 0)),
+            -1 * (int(getattr(result, "end", 0)) - int(getattr(result, "start", 0))),
+            -1 * float(getattr(result, "score", 0.0) or 0.0),
+        ),
+    )
+
+    selected: list[object] = []
+    for candidate in ranked:
+        start = int(getattr(candidate, "start", 0))
+        end = int(getattr(candidate, "end", 0))
+        overlaps = any(start < int(getattr(existing, "end", 0)) and end > int(getattr(existing, "start", 0)) for existing in selected)
+        if overlaps:
+            continue
+        selected.append(candidate)
+
+    return selected
+
+
 class PhiSanitizer:
     """
     Wraps the Presidio Analyzer + Anonymizer REST containers.
-    Falls back to local regex-only mode if the containers are unreachable
-    (useful during local dev without Docker).
+    Runs in strict Presidio-only mode: no regex fallback.
     """
 
     def __init__(self) -> None:
@@ -120,17 +143,12 @@ class PhiSanitizer:
         self._modes_used: set[str] = set()
         self._local_analyzer = None
 
-        if self._backend == "local":
-            self._init_local_analyzer()
-
     @property
     def sanitization_mode(self) -> str:
         if "presidio_local" in self._modes_used:
             return "presidio_local"
         if "presidio_remote" in self._modes_used:
             return "presidio_remote"
-        if "regex_fallback" in self._modes_used:
-            return "regex_fallback"
         if "presidio" in self._modes_used:
             return "presidio"
         return "unknown"
@@ -150,42 +168,77 @@ class PhiSanitizer:
                 result = self._local_presidio_sanitize(text)
                 self._modes_used.add("presidio_local")
                 return result
-            except Exception as exc:
-                logger.warning(
-                    "Local Presidio unavailable (%s) — falling back to local regex masking.",
-                    exc,
-                )
-                self._modes_used.add("regex_fallback")
-                return self._regex_fallback(text)
+            except (Exception, SystemExit) as exc:
+                raise PhiSanitizationError(
+                    "Local Presidio sanitization failed; regex fallback is disabled.",
+                    str(exc),
+                ) from exc
 
         try:
             result = await self._presidio_sanitize(text)
             self._modes_used.add("presidio_remote")
             return result
         except Exception as exc:
-            logger.warning(
-                "Presidio container unreachable (%s) — falling back to local regex masking.",
-                exc,
-            )
-            self._modes_used.add("regex_fallback")
-            return self._regex_fallback(text)
+            raise PhiSanitizationError(
+                "Remote Presidio sanitization failed; regex fallback is disabled.",
+                str(exc),
+            ) from exc
 
     def _init_local_analyzer(self) -> None:
         try:
-            from presidio_analyzer import AnalyzerEngine
+            from presidio_analyzer import AnalyzerEngine, Pattern, PatternRecognizer
         except ImportError as exc:
             raise PhiSanitizationError(
                 "presidio-analyzer is not installed for local backend",
                 str(exc),
             ) from exc
 
-        self._local_analyzer = AnalyzerEngine()
+        try:
+            self._local_analyzer = AnalyzerEngine()
+            # Enforce SSN coverage in local mode with an explicit recognizer.
+            ssn_recognizer = PatternRecognizer(
+                supported_entity="US_SSN",
+                patterns=[
+                    Pattern(
+                        name="strict_us_ssn",
+                        regex=r"\b\d{3}-\d{2}-\d{4}\b",
+                        score=0.9,
+                    )
+                ],
+            )
+            patient_name_recognizer = PatternRecognizer(
+                supported_entity="PERSON",
+                patterns=[
+                    Pattern(
+                        name="patient_name_dash",
+                        regex=r"(?<=Patient Name - )[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+",
+                        score=0.9,
+                    ),
+                    Pattern(
+                        name="patient_name_colon",
+                        regex=r"(?<=Patient Name: )[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+",
+                        score=0.9,
+                    ),
+                ],
+            )
+            self._local_analyzer.registry.add_recognizer(ssn_recognizer)
+            self._local_analyzer.registry.add_recognizer(patient_name_recognizer)
+        except (Exception, SystemExit) as exc:
+            raise PhiSanitizationError(
+                "Local Presidio analyzer initialization failed. Ensure spaCy model assets and package installer (pip/uv) are available.",
+                str(exc),
+            ) from exc
 
     def _local_presidio_sanitize(self, text: str) -> str:
         if self._local_analyzer is None:
             self._init_local_analyzer()
 
-        analyzer_results = self._local_analyzer.analyze(text=text, language="en")
+        analyzer_results = self._local_analyzer.analyze(
+            text=text,
+            language="en",
+            entities=_PHI_ENTITIES,
+        )
+        analyzer_results = _filter_overlapping_results(analyzer_results)
         if not analyzer_results:
             return text
 
@@ -203,8 +256,8 @@ class PhiSanitizer:
             return SanitizedWorkItem(**item.model_dump(exclude={"raw_fields", "sanitization_status"}))
 
         title = await self.sanitize_text(item.title or "")
-        description = await self.sanitize_text(item.description or "") if item.description else None
-        acceptance = await self.sanitize_text(item.acceptance_criteria or "") if item.acceptance_criteria else None
+        description = await self.sanitize_text(strip_html(item.description or "")) if item.description else None
+        acceptance = await self.sanitize_text(strip_html(item.acceptance_criteria or "")) if item.acceptance_criteria else None
         assigned_to = await self.sanitize_text(item.assigned_to or "") if item.assigned_to else None
         created_by = await self.sanitize_text(item.created_by or "") if item.created_by else None
         tags = [await self.sanitize_text(tag) for tag in item.tags]
@@ -280,10 +333,29 @@ class PhiSanitizer:
             if not results:
                 return text  # No PHI detected
 
+            # Preserve the strongest span where providers return overlapping entities
+            # such as EMAIL_ADDRESS and URL over the email domain.
+            ranked_results = sorted(
+                results,
+                key=lambda result: (
+                    int(result.get("start", 0)),
+                    -1 * (int(result.get("end", 0)) - int(result.get("start", 0))),
+                    -1 * float(result.get("score", 0.0) or 0.0),
+                ),
+            )
+            filtered_results: list[dict[str, object]] = []
+            for candidate in ranked_results:
+                start = int(candidate.get("start", 0))
+                end = int(candidate.get("end", 0))
+                overlaps = any(start < int(existing.get("end", 0)) and end > int(existing.get("start", 0)) for existing in filtered_results)
+                if overlaps:
+                    continue
+                filtered_results.append(candidate)
+
             # 2. Replace each detected span with a deterministic dummy based on the
             # original value, preserving sentence structure and utility.
             masked = text
-            for result in sorted(results, key=lambda r: int(r.get("start", 0)), reverse=True):
+            for result in sorted(filtered_results, key=lambda r: int(r.get("start", 0)), reverse=True):
                 start = int(result.get("start", -1))
                 end = int(result.get("end", -1))
                 entity = str(result.get("entity_type", "PHI"))
@@ -295,30 +367,3 @@ class PhiSanitizer:
 
             return masked
 
-    # ── Local fallback (no Docker) ────────────────────────────────────────────
-
-    def _regex_fallback(self, text: str) -> str:
-        """
-        Basic regex masking used when Presidio containers are not running.
-        Not as thorough as Presidio — do NOT use in production.
-        """
-        import re
-
-        patterns = [
-            # Email
-            (r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", "EMAIL"),
-            # US phone
-            (r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "PHONE"),
-            # SSN
-            (r"\b\d{3}-\d{2}-\d{4}\b", "SSN"),
-            # Names (simple heuristic: Title Case two-word combos)
-            (r"\b[A-Z][a-z]+ [A-Z][a-z]+\b", "PERSON"),
-        ]
-        result = text
-        for pattern, label in patterns:
-            result = re.sub(
-                pattern,
-                lambda m, lbl=label: _dummy_for(m.group(), lbl),
-                result,
-            )
-        return result

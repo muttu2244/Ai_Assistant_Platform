@@ -2,3 +2,12 @@
 .env.old
 .env.example
 venv
+.venv
+
+# Build and deployment artifacts
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/

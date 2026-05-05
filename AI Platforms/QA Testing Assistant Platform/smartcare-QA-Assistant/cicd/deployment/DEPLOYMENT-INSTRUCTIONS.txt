@@ -1,0 +1,34 @@
+SmartCare QA Assistant - Deployment Instructions
+
+This artifact is designed for a Windows server or VM where BRT deploys files directly.
+
+Prerequisites
+- Python 3.11 x64 installed and available on PATH
+- PowerShell 5.1 or later
+- Network access to the Azure services configured in .env
+- If SQL features are enabled, install Microsoft ODBC Driver 18 for SQL Server
+
+Artifact contents
+- src\                        application source code
+- requirements.txt            Python dependencies
+- pyproject.toml              package metadata
+- deployment\Install-SmartCareQA.ps1
+- deployment\Start-SmartCareQA.ps1
+- deployment\SmartCareQA.env.template
+- infrastructure\            reference-only infrastructure files from source control
+
+Recommended deployment flow
+1. Extract the artifact zip to a target folder.
+2. Copy deployment\SmartCareQA.env.template to .env in the package root.
+3. Update .env with environment-specific values.
+4. Run:
+   powershell -ExecutionPolicy Bypass -File deployment\Install-SmartCareQA.ps1 -InstallLocalPresidioModel
+5. Start the application:
+   powershell -ExecutionPolicy Bypass -File deployment\Start-SmartCareQA.ps1 -Port 8000
+
+Notes for BRT
+- The app starts with uvicorn and listens on port 8000 by default.
+- The package defaults to local Presidio usage in the template because no container runtime is assumed.
+- If BRT hosts Presidio as a separate service, set PRESIDIO_BACKEND=remote and update the Presidio URLs.
+- The application entrypoint is src.chat_ui.app:app
+- If outbound package installation is blocked, dependencies must be installed from an approved internal Python package source.

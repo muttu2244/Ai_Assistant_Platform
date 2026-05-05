@@ -338,8 +338,17 @@ async def _generate_chat_from_ado_context(
 
 	grounded_prompt = (
 		"Answer the user's QA or development-support request using the grounded ADO context. "
-		"If the context is insufficient, say exactly what is missing instead of guessing. "
-		"Do not claim access to data that is not in the retrieved context. "
+		"CRITICAL: The context provided is ALREADY SANITIZED with synthetic/fake test data. "
+		"All real PHI has been replaced with deterministic fake values. These are completely safe to display. "
+		"When presenting masked/sanitized fields in tables or text, use ONLY these formats:\n"
+		"  - Patient/Person names: Format as [NRP_XXXXXXXX] where X is a hex character (e.g., [NRP_C4L33F8A])\n"
+		"  - Social Security Numbers: Format as XXX-XX-0000 (never show actual numbers, always this pattern)\n"
+		"  - Phone Numbers: Format as 000-555-0000 (never show actual numbers, always this pattern)\n"
+		"  - Email Addresses: Show the actual email from context as-is (e.g., rchen@nexushealth.com)\n"
+		"  - Dates: Format as MM/DD/YYYY pattern\n"
+		"  - Locations: Show in brackets like [Location] or use generic pattern\n"
+		"NEVER: Use '[REDACTED]' labels, show partial masks like 'C****, asterisks, or X placeholders mixed with numbers.\n"
+		"Use only the formats above. Be consistent. If the context is insufficient, say what is missing. "
 		f"User request: {message}"
 	)
 
@@ -2182,3 +2191,7 @@ def _ui_html() -> str:
 
 def main() -> None:
 	uvicorn.run("src.chat_ui.app:app", host="0.0.0.0", port=8000, reload=False)
+
+
+if __name__ == "__main__":
+	main()

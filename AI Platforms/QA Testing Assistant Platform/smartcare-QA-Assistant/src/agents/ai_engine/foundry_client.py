@@ -6,12 +6,10 @@ Only ever receives SANITIZED data. PHI must have been stripped by STEP 2 first.
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 from typing import Any
 
-from anthropic import AnthropicFoundry
-from azure.identity import DefaultAzureCredential
-from openai import AsyncAzureOpenAI, APIStatusError, RateLimitError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 from src.common.config.settings import get_settings
@@ -19,6 +17,65 @@ from src.common.exceptions.errors import AiContentFilterError, AiEngineError, Ai
 from src.common.utils.helpers import truncate_text
 
 logger = logging.getLogger(__name__)
+
+
+def _load_anthropic_foundry() -> type[Any]:
+    try:
+        anthropic_module = importlib.import_module("anthropic")
+    except ImportError as exc:
+        raise AiEngineError(
+            "Anthropic support is not installed. Install the 'anthropic' package or use an Azure OpenAI endpoint.",
+            str(exc),
+        ) from exc
+
+    client_class = getattr(anthropic_module, "AnthropicFoundry", None)
+    if client_class is None:
+        raise AiEngineError(
+            "Installed anthropic package does not expose AnthropicFoundry. Upgrade to a compatible version or switch providers.",
+            anthropic_module.__file__ or "anthropic",
+        )
+
+    return client_class
+
+
+def _load_default_azure_credential() -> type[Any]:
+    try:
+        azure_identity = importlib.import_module("azure.identity")
+    except ImportError as exc:
+        raise AiEngineError(
+            "Azure Identity support is not installed. Install 'azure-identity' to use Foundry authentication.",
+            str(exc),
+        ) from exc
+
+    credential_class = getattr(azure_identity, "DefaultAzureCredential", None)
+    if credential_class is None:
+        raise AiEngineError(
+            "Installed azure.identity package does not expose DefaultAzureCredential.",
+            azure_identity.__file__ or "azure.identity",
+        )
+
+    return credential_class
+
+
+def _load_openai_sdk() -> tuple[type[Any], type[Exception], type[Exception]]:
+    try:
+        openai_module = importlib.import_module("openai")
+    except ImportError as exc:
+        raise AiEngineError(
+            "OpenAI SDK is not installed. Install 'openai' to use Azure OpenAI deployments.",
+            str(exc),
+        ) from exc
+
+    async_client = getattr(openai_module, "AsyncAzureOpenAI", None)
+    api_status_error = getattr(openai_module, "APIStatusError", None)
+    rate_limit_error = getattr(openai_module, "RateLimitError", None)
+    if not all((async_client, api_status_error, rate_limit_error)):
+        raise AiEngineError(
+            "Installed openai package is missing Azure OpenAI client symbols. Upgrade to a compatible version.",
+            openai_module.__file__ or "openai",
+        )
+
+    return async_client, api_status_error, rate_limit_error
 
 # ── System prompts ────────────────────────────────────────────────────────────
 
@@ -111,42 +168,46 @@ class FoundryClient:
         deployment = (s.ai_foundry_deployment or "").strip()
 
         self._provider = "anthropic" if self._is_anthropic_config(endpoint, deployment) else "openai"
-        self._credential: DefaultAzureCredential | None = None
+        self._credential: Any | None = None
 
         configured_api_key = s.ai_foundry_api_key if (s.ai_foundry_api_key and s.ai_foundry_api_key.strip() and s.ai_foundry_api_key != "YOUR_KEY") else None
 
         if self._provider == "anthropic":
+            anthropic_foundry = _load_anthropic_foundry()
             base_url = self._normalize_anthropic_base_url(endpoint)
             if configured_api_key:
                 logger.info("Using API key for Anthropic Foundry authentication")
-                self._client = AnthropicFoundry(api_key=configured_api_key, base_url=base_url)
+                self._client = anthropic_foundry(api_key=configured_api_key, base_url=base_url)
             else:
-                self._credential = DefaultAzureCredential()
+                default_azure_credential = _load_default_azure_credential()
+                self._credential = default_azure_credential()
                 logger.info("Using Entra ID for Anthropic Foundry authentication")
-                self._client = AnthropicFoundry(
+                self._client = anthropic_foundry(
                     base_url=base_url,
                     azure_ad_token_provider=self._anthropic_token_provider,
                 )
             self._anthropic_base_url = base_url
         else:
+            async_azure_openai, self._openai_api_status_error, self._openai_rate_limit_error = _load_openai_sdk()
             openai_endpoint = self._normalize_openai_endpoint(endpoint)
             if configured_api_key:
                 logger.info("Using API key for Azure OpenAI authentication")
-                self._client = AsyncAzureOpenAI(
+                self._client = async_azure_openai(
                     azure_endpoint=openai_endpoint,
                     api_key=configured_api_key,
                     api_version=s.ai_foundry_api_version,
                 )
             else:
                 logger.info("Using Entra ID for Azure OpenAI authentication")
-                self._credential = DefaultAzureCredential()
+                default_azure_credential = _load_default_azure_credential()
+                self._credential = default_azure_credential()
 
                 def token_provider() -> str:
                     assert self._credential is not None
                     token = self._credential.get_token("https://cognitiveservices.azure.com/.default")
                     return token.token
 
-                self._client = AsyncAzureOpenAI(
+                self._client = async_azure_openai(
                     azure_endpoint=openai_endpoint,
                     azure_ad_token_provider=token_provider,
                     api_version=s.ai_foundry_api_version,
@@ -241,10 +302,10 @@ class FoundryClient:
                 max_tokens=self._max_tokens,
                 temperature=self._temperature,
             )
-        except RateLimitError as exc:
+        except self._openai_rate_limit_error as exc:
             logger.warning("Model rate limit hit — will retry: %s", exc)
             raise AiRateLimitError("Model rate limit", str(exc)) from exc
-        except APIStatusError as exc:
+        except self._openai_api_status_error as exc:
             if exc.status_code == 400 and "content_filter" in str(exc).lower():
                 raise AiContentFilterError("Azure Content Safety blocked this request.", str(exc)) from exc
             raise AiEngineError(f"Model API error {exc.status_code}", str(exc)) from exc
@@ -286,6 +347,11 @@ class FoundryClient:
             status_code = getattr(exc, "status_code", None)
             if status_code == 401:
                 raise AiEngineError("Anthropic API error 401: Check your Entra credentials or RBAC role on the Foundry resource", str(exc)) from exc
+            if status_code == 403:
+                raise AiEngineError(
+                    "Anthropic API error 403: Access denied. Verify Foundry RBAC role assignment and model deployment permissions for this identity.",
+                    str(exc),
+                ) from exc
             if status_code is not None:
                 raise AiEngineError(f"Anthropic API error {status_code}", str(exc)) from exc
             raise AiEngineError("Unexpected Anthropic error", str(exc)) from exc

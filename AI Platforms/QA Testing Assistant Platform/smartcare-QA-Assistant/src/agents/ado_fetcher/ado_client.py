@@ -419,13 +419,21 @@ class AdoClient:
         return [item["id"] for item in data.get("workItems", [])]
 
     def _parse_work_item(self, data: dict) -> AdoWorkItem:
-        fields = flatten_ado_fields(data.get("fields", {}))
+        raw_fields = data.get("fields", {})
+        fields = flatten_ado_fields(raw_fields)
+        custom_issue_description = raw_fields.get("Custom.DescriptionforIssues")
+        if custom_issue_description:
+            base_description = fields.get("description")
+            if base_description and custom_issue_description not in base_description:
+                fields["description"] = f"{base_description}\n\n{custom_issue_description}"
+            elif not base_description:
+                fields["description"] = custom_issue_description
         fields.setdefault("id", data.get("id"))
         tags_raw = fields.pop("tags", [])
         return AdoWorkItem(
             **fields,
             tags=tags_raw if isinstance(tags_raw, list) else [],
-            raw_fields=data.get("fields", {}),
+            raw_fields=raw_fields,
         )
 
     # ── Test Case Fetching ────────────────────────────────────────────────────

@@ -41,3 +41,9 @@ User prompt: Create a test pack.
 5) Scenario 5: GENERIC QA QUESTION (NO CLARIFICATION NEEDED)
 User prompt: What is the difference between smoke testing and sanity testing?
 
+
+
+
+1) "get and every detail from ADO , regarding the item 676786, with respect to Title, Area, Description , planning details, etc etc , but make sure to mask the PHI information"
+2)  Analyze requirement-to-test traceability for work item 640467 and list missing coverage.
+3) Generate coverage gaps for ADO work item 79489

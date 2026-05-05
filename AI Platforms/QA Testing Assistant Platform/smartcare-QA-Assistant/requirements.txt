@@ -1,5 +1,9 @@
 # SmartCare QA Assistant — Python dependencies
 
+# Build tools
+setuptools>=70
+wheel
+
 # Core framework
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0

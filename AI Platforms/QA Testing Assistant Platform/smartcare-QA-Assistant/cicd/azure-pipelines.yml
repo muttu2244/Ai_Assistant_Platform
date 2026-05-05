@@ -1,0 +1,51 @@
+trigger:
+  - main
+  - develop
+
+pool:
+  vmImage: 'windows-latest'
+
+variables:
+  pythonVersion: '3.11'
+  artifactName: 'smartcare-qa-assistant'
+
+stages:
+  - stage: Build
+    displayName: 'Package Deployment Artifact'
+    jobs:
+      - job: BuildJob
+        displayName: 'Package Job'
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '$(pythonVersion)'
+            displayName: 'Use Python $(pythonVersion)'
+
+          - script: |
+              python --version
+              python -m py_compile src/chat_ui/app.py
+              python -m compileall src
+            displayName: 'Validate Python sources'
+
+          - task: PowerShell@2
+            inputs:
+              filePath: '$(Build.SourcesDirectory)/cicd/package_deployment.ps1'
+              arguments: '-OutputRoot "$(Build.ArtifactStagingDirectory)" -BuildLabel "$(Build.BuildId)"'
+              pwsh: false
+            displayName: 'Create deployment bundle'
+
+          - task: ArchiveFiles@2
+            inputs:
+              rootFolderOrFile: '$(Build.ArtifactStagingDirectory)/$(artifactName)'
+              includeRootFolder: true
+              archiveType: 'zip'
+              archiveFile: '$(Build.ArtifactStagingDirectory)/$(artifactName)-$(Build.BuildId).zip'
+              replaceExistingArchive: true
+            displayName: 'Archive deployment bundle'
+
+          - task: PublishBuildArtifacts@1
+            inputs:
+              pathToPublish: '$(Build.ArtifactStagingDirectory)'
+              artifactName: '$(artifactName)'
+              publishLocation: 'Container'
+            displayName: 'Publish artifacts'
