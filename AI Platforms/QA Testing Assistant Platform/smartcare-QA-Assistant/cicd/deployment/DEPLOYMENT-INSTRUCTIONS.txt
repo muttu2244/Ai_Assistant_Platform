@@ -7,6 +7,7 @@ Prerequisites
 - PowerShell 5.1 or later
 - Network access to the Azure services configured in .env
 - If SQL features are enabled, install Microsoft ODBC Driver 18 for SQL Server
+- For IIS hosting: IIS with HttpPlatformHandler module installed
 
 Artifact contents
 - src\                        application source code
@@ -15,6 +16,8 @@ Artifact contents
 - deployment\Install-SmartCareQA.ps1
 - deployment\Start-SmartCareQA.ps1
 - deployment\SmartCareQA.env.template
+- deployment\\iis\\README-IIS.txt
+- deployment\\iis\\web.config.httpplatform.template
 - infrastructure\            reference-only infrastructure files from source control
 
 Recommended deployment flow
@@ -32,3 +35,15 @@ Notes for BRT
 - If BRT hosts Presidio as a separate service, set PRESIDIO_BACKEND=remote and update the Presidio URLs.
 - The application entrypoint is src.chat_ui.app:app
 - If outbound package installation is blocked, dependencies must be installed from an approved internal Python package source.
+
+IIS hosting notes (for folder-based deployment)
+1. Create an IIS website that points to this extracted package root folder.
+2. Copy deployment\\iis\\web.config.httpplatform.template to web.config in the site root.
+3. Update the Python executable path in web.config to match server installation.
+4. Configure environment variables in IIS or in the server-level environment as needed.
+5. Ensure the App Pool identity has read/execute permission on the deployment folder.
+6. Recycle app pool and browse the IIS URL.
+
+Important
+- This is a FastAPI (ASGI) app, so IIS should run it via HttpPlatformHandler + uvicorn (template provided).
+- Standard .NET publish-only assumptions do not apply directly to Python projects.

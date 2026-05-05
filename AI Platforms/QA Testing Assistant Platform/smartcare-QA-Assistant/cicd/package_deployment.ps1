@@ -55,6 +55,8 @@ $manifestLines = @(
     "- deployment\\Start-SmartCareQA.ps1",
     "- deployment\\SmartCareQA.env.template",
     "- deployment\\DEPLOYMENT-INSTRUCTIONS.txt",
+    "- deployment\\iis\\README-IIS.txt",
+    "- deployment\\iis\\web.config.httpplatform.template",
     "- infrastructure\\ (reference only)",
     "",
     "Recommended BRT handoff files:",

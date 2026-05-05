@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<configuration>
+  <system.webServer>
+    <handlers>
+      <add name="httpPlatform" path="*" verb="*" modules="httpPlatformHandler" resourceType="Unspecified"/>
+    </handlers>
+    <httpPlatform
+      processPath="C:\\Apps\\smartcare-qa-assistant\\.venv\\Scripts\\python.exe"
+      arguments="-m uvicorn src.chat_ui.app:app --host 127.0.0.1 --port %HTTP_PLATFORM_PORT%"
+      stdoutLogEnabled="true"
+      stdoutLogFile="C:\\Apps\\smartcare-qa-assistant\\logs\\stdout"
+      startupTimeLimit="120"
+      requestTimeout="00:05:00">
+      <environmentVariables>
+        <environmentVariable name="PYTHONPATH" value="C:\\Apps\\smartcare-qa-assistant" />
+      </environmentVariables>
+    </httpPlatform>
+  </system.webServer>
+</configuration>
