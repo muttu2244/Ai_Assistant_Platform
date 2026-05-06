@@ -1,6 +1,8 @@
 trigger:
-  - main
-  - develop
+  branches:
+    include:
+      - main
+      - develop
 
 pool:
   vmImage: 'windows-latest'
