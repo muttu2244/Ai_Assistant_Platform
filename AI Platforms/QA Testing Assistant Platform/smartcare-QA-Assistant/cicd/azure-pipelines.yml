@@ -23,15 +23,38 @@ stages:
               versionSpec: '$(pythonVersion)'
             displayName: 'Use Python $(pythonVersion)'
 
-          - script: |
-              python --version
-              python -m py_compile src/chat_ui/app.py
-              python -m compileall src
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: |
+                $scriptFile = Get-ChildItem -Path "$(Build.SourcesDirectory)" -Filter "package_deployment.ps1" -Recurse |
+                  Where-Object { $_.FullName -match "[\\/]cicd[\\/]package_deployment\.ps1$" } |
+                  Select-Object -First 1
+
+                if (-not $scriptFile) {
+                  throw "Could not find cicd/package_deployment.ps1 under $(Build.SourcesDirectory)"
+                }
+
+                $projectRoot = Split-Path -Path $scriptFile.DirectoryName -Parent
+                Write-Host "Detected project root: $projectRoot"
+                Write-Host "##vso[task.setvariable variable=ProjectRoot]$projectRoot"
+            pwsh: false
+            displayName: 'Detect project root'
+
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: |
+                Set-Location "$(ProjectRoot)"
+                python --version
+                python -m py_compile src/chat_ui/app.py
+                python -m compileall src
+            pwsh: false
             displayName: 'Validate Python sources'
 
           - task: PowerShell@2
             inputs:
-              filePath: '$(Build.SourcesDirectory)/cicd/package_deployment.ps1'
+              filePath: '$(ProjectRoot)/cicd/package_deployment.ps1'
               arguments: '-OutputRoot "$(Build.ArtifactStagingDirectory)" -BuildLabel "$(Build.BuildId)"'
               pwsh: false
             displayName: 'Create deployment bundle'
