@@ -38,7 +38,7 @@ stages:
                 $projectRoot = Split-Path -Path $scriptFile.DirectoryName -Parent
                 Write-Host "Detected project root: $projectRoot"
                 Write-Host "##vso[task.setvariable variable=ProjectRoot]$projectRoot"
-            pwsh: false
+              pwsh: false
             displayName: 'Detect project root'
 
           - task: PowerShell@2
@@ -49,7 +49,7 @@ stages:
                 python --version
                 python -m py_compile src/chat_ui/app.py
                 python -m compileall src
-            pwsh: false
+              pwsh: false
             displayName: 'Validate Python sources'
 
           - task: PowerShell@2
