@@ -41,9 +41,28 @@ User prompt: Create a test pack.
 5) Scenario 5: GENERIC QA QUESTION (NO CLARIFICATION NEEDED)
 User prompt: What is the difference between smoke testing and sanity testing?
 
+WITH NO IDs
+
+  Feature/module name search:
+
+6) Find coverage gaps for patient inquiry language and interpreter preference fields.
+7) Generate test cases for the appointment scheduling cancellation flow.
+8) What are the high-risk test areas for the prior authorization submission module?
+
+  Domain keyword search:
+
+9) Analyze traceability for the discharge summary documentation feature.
+10) Generate automation scripts for the insurance eligibility verification workflow.
+11) List missing test coverage for the clinical notes attachment functionality.
+
+ Defect/risk search without ID:
+
+12) Summarize linked defect risks for the patient portal login and MFA flow.
+13) What are the coverage gaps for the referral management and care coordination module?
 
 
 
 1) "get and every detail from ADO , regarding the item 676786, with respect to Title, Area, Description , planning details, etc etc , but make sure to mask the PHI information"
 2)  Analyze requirement-to-test traceability for work item 640467 and list missing coverage.
 3) Generate coverage gaps for ADO work item 79489
+4) Generate some testcase for ADO work item 79489 in a tabular format

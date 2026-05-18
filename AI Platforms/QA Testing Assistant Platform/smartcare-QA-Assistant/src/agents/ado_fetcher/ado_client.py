@@ -10,6 +10,7 @@ from Azure DevOps REST API.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import re
@@ -449,8 +450,7 @@ class AdoClient:
         Return all test cases linked to a user story.
         Uses the work item links API to find TestCase relations.
         """
-        url = self._url(f"wit/workitems/{story_id}")
-        data = await self._get(url, params={"$expand": "relations"})
+        data = await self._get(self._url(f"wit/workitems/{story_id}"), params={"$expand": "relations"})
         relations = data.get("relations", [])
         tc_ids = [
             int(r["url"].split("/")[-1])
@@ -459,8 +459,26 @@ class AdoClient:
         ]
         if not tc_ids:
             return []
-        items = await self.get_work_items(tc_ids)
-        return [self._work_item_to_test_case(wi) for wi in items]
+
+        dedup_ids = list(dict.fromkeys(tc_ids))[:40]
+        tasks = [self.get_test_case(tc_id) for tc_id in dedup_ids]
+        detailed_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        detailed_cases: list[AdoTestCase] = []
+        fallback_ids: list[int] = []
+        for tc_id, result in zip(dedup_ids, detailed_results):
+            if isinstance(result, Exception):
+                logger.warning("Unable to fetch detailed test case %s for story %s: %s", tc_id, story_id, result)
+                fallback_ids.append(tc_id)
+                continue
+            result.associated_story_ids = [story_id]
+            detailed_cases.append(result)
+
+        if fallback_ids:
+            items = await self.get_work_items(fallback_ids)
+            detailed_cases.extend([self._work_item_to_test_case(wi) for wi in items])
+
+        return detailed_cases
 
     async def get_stories_without_test_cases(self) -> list[AdoWorkItem]:
         """Return user stories that have no linked test cases (coverage gaps)."""

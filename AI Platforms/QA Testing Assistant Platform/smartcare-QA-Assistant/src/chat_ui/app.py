@@ -13,11 +13,12 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import logging
+from pathlib import Path
 import re
 from typing import Literal
 
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -28,6 +29,8 @@ from src.common.config.settings import get_settings
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
+ROOT_DIR = Path(__file__).resolve().parents[2]
+LANDING_LOGO_PATH = ROOT_DIR / "Streamline_Logo_Gradient.JPG"
 
 
 @asynccontextmanager
@@ -178,6 +181,57 @@ def _count_generated_cases(text: str) -> int:
 	return len(section_matches)
 
 
+def _is_linked_testcase_table_request(message: str) -> bool:
+	lower = (message or "").lower()
+	table_requested = "table" in lower or "tabular" in lower
+	tc_requested = (
+		"linked test" in lower
+		or "testcase" in lower
+		or "test case" in lower
+	)
+	extract_requested = any(token in lower for token in ("extract", "list", "show", "print", "details"))
+	return table_requested and tc_requested and extract_requested
+
+
+def _table_cell(value: str) -> str:
+	clean = (value or "").strip()
+	if not clean:
+		return "Not provided"
+	return clean.replace("|", "\\|").replace("\n", "<br>")
+
+
+def _build_linked_testcase_markdown_table(rows: list[dict[str, str]]) -> str:
+	if not rows:
+		return "No linked test cases were found for this work item."
+
+	headers = [
+		"Test Case ID",
+		"Description",
+		"Pre-Conditions",
+		"Test Steps",
+		"Expected Result",
+	]
+	lines = [
+		"| " + " | ".join(headers) + " |",
+		"| --- | --- | --- | --- | --- |",
+	]
+	for row in rows:
+		lines.append(
+			"| "
+			+ " | ".join(
+				[
+					_table_cell(row.get("test_case_id", "")),
+					_table_cell(row.get("description", "")),
+					_table_cell(row.get("pre_conditions", "")),
+					_table_cell(row.get("test_steps", "")),
+					_table_cell(row.get("expected_result", "")),
+				]
+			)
+			+ " |"
+		)
+	return "\n".join(lines)
+
+
 def _prepend_response_meta_header(message_text: str, meta: dict[str, object]) -> str:
 	"""Add a compact provenance header to assistant text for grounded responses."""
 	if not meta:
@@ -306,10 +360,31 @@ async def _generate_chat_from_ado_context(
 		)
 
 	safe_linked_cases: list[str] = []
+	table_rows: list[dict[str, str]] = []
 	for tc in full_context.get("linked_test_cases", [])[:8]:
 		safe_tc = await phi.sanitize_test_case(tc)
+		step_actions: list[str] = []
+		expected_outcomes: list[str] = []
+		for index, step in enumerate(safe_tc.steps[:8], start=1):
+			action = _strip_html(step.get("action", ""))
+			expected = _strip_html(step.get("expected", ""))
+			if action:
+				step_actions.append(f"{index}. {action}")
+			if expected:
+				expected_outcomes.append(f"{index}. {expected}")
+
+		pre_conditions = "Not explicitly available in linked ADO test case metadata"
+		table_rows.append(
+			{
+				"test_case_id": f"TC-{safe_tc.id}",
+				"description": _strip_html(safe_tc.title),
+				"pre_conditions": pre_conditions,
+				"test_steps": "\n".join(step_actions) if step_actions else "Not provided",
+				"expected_result": "\n".join(expected_outcomes) if expected_outcomes else "Not provided",
+			}
+		)
 		safe_linked_cases.append(
-			f"- TC {safe_tc.id}: {_strip_html(safe_tc.title)} [{safe_tc.state}] automated={safe_tc.automated}"
+			f"- TC {safe_tc.id}: {_strip_html(safe_tc.title)} [{safe_tc.state}] automated={safe_tc.automated} steps={len(safe_tc.steps)}"
 		)
 
 	context_sections = [
@@ -326,7 +401,45 @@ async def _generate_chat_from_ado_context(
 		context_sections.append("Related Work Items:\n" + "\n".join(safe_related_titles))
 	if safe_linked_cases:
 		context_sections.append("Existing Linked Test Cases:\n" + "\n".join(safe_linked_cases))
+	if table_rows:
+		details_lines = []
+		for row in table_rows:
+			details_lines.append(
+				"TC-ID: {id}\nTitle: {title}\nPre-Conditions: {pre}\nTest Steps:\n{steps}\nExpected Result:\n{expected}".format(
+					id=row["test_case_id"],
+					title=row["description"],
+					pre=row["pre_conditions"],
+					steps=row["test_steps"],
+					expected=row["expected_result"],
+				)
+			)
+		context_sections.append("Linked Test Case Detailed Rows:\n" + "\n\n".join(details_lines))
 	ado_context = "\n\n".join(context_sections)
+
+	response_meta = {
+		"source": "ado_live",
+		"grounded": True,
+		"work_item_id": safe_item.id,
+		"selection_mode": selection_mode,
+		"presidio_check": "enabled",
+		"sanitization_mode": phi.sanitization_mode,
+	}
+
+	if _is_linked_testcase_table_request(message):
+		table_text = _build_linked_testcase_markdown_table(table_rows)
+		safe_table_text = await phi.sanitize_output(table_text)
+		response_with_meta = _prepend_response_meta_header(safe_table_text, response_meta)
+		return {
+			"assistant_message": response_with_meta,
+			"source": "ado_live",
+			"grounded": True,
+			"used_work_item_id": safe_item.id,
+			"used_work_item_title": _strip_html(safe_item.title),
+			"selection_mode": selection_mode,
+			"presidio_protected": True,
+			"sanitization_mode": phi.sanitization_mode,
+			"response_meta": response_meta,
+		}
 
 	lower = message.lower()
 	if "automation" in lower or "script" in lower or "selenium" in lower:
@@ -349,6 +462,7 @@ async def _generate_chat_from_ado_context(
 		"  - Locations: Show in brackets like [Location] or use generic pattern\n"
 		"NEVER: Use '[REDACTED]' labels, show partial masks like 'C****, asterisks, or X placeholders mixed with numbers.\n"
 		"Use only the formats above. Be consistent. If the context is insufficient, say what is missing. "
+		"If the user asks for table/tabular output, return a markdown table with explicit headers and one row per item. "
 		f"User request: {message}"
 	)
 
@@ -360,14 +474,6 @@ async def _generate_chat_from_ado_context(
 		context=ado_context,
 	)
 	safe_response = await phi.sanitize_output(response)
-	response_meta = {
-		"source": "ado_live",
-		"grounded": True,
-		"work_item_id": safe_item.id,
-		"selection_mode": selection_mode,
-		"presidio_check": "enabled",
-		"sanitization_mode": phi.sanitization_mode,
-	}
 	response_with_meta = _prepend_response_meta_header(safe_response, response_meta)
 	return {
 		"assistant_message": response_with_meta,
@@ -661,6 +767,11 @@ def _mock_sprint_summary() -> dict[str, object]:
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
 	return _ui_html()
+
+
+@app.get("/brand-logo")
+async def brand_logo() -> FileResponse:
+	return FileResponse(LANDING_LOGO_PATH)
 
 
 @app.get("/api/status")
@@ -1242,6 +1353,7 @@ def _ui_html() -> str:
 		}
 
 		.brand-lockup{display:flex;align-items:center;gap:12px;}
+		.brand-logo{display:block;width:min(100%,560px);height:auto;}
 		.brand-icon{
 			width:38px;
 			height:38px;
@@ -1512,6 +1624,22 @@ def _ui_html() -> str:
 			color:#2f3a4f;
 			width:100%;
 		}
+		.chat-markdown-table-wrap{overflow:auto;margin:8px 0;}
+		.chat-markdown-table{
+			width:100%;
+			border-collapse:collapse;
+			font-size:13px;
+			min-width:680px;
+		}
+		.chat-markdown-table th,
+		.chat-markdown-table td{
+			border:1px solid var(--line);
+			padding:8px 10px;
+			vertical-align:top;
+			white-space:normal;
+		}
+		.chat-markdown-table th{background:#f5f8ff;color:#405575;text-align:left;}
+		.chat-text-block{margin:0 0 8px;white-space:pre-wrap;}
 		.chat-meta{
 			display:flex;
 			flex-wrap:wrap;
@@ -1611,11 +1739,7 @@ def _ui_html() -> str:
 			<article class="card">
 				<div class="card-head">
 					<div class="brand-lockup">
-						<div class="brand-icon">QA</div>
-						<div>
-							<h1 class="brand-title">Streamline</h1>
-							<p class="brand-sub">AI-Powered Testing Assistant</p>
-						</div>
+						<img class="brand-logo" src="/brand-logo" alt="Streamline Healthcare logo"/>
 					</div>
 					<button class="ghost-btn" onclick="showView('keyword')">Open Workspace</button>
 				</div>
@@ -1739,7 +1863,9 @@ def _ui_html() -> str:
 		}
 
 		function setKeywordResult(text) {
-			document.getElementById('keywordResult').textContent = text || 'No output generated.';
+			var host = document.getElementById('keywordResult');
+			host.innerHTML = '';
+			renderMessageBody(host, text || 'No output generated.');
 		}
 
 		function setKeywordLoading(isLoading) {
@@ -2092,6 +2218,100 @@ def _ui_html() -> str:
 			return pills;
 		}
 
+		function splitMarkdownRow(line) {
+			var cells = line.split('|').map(function(cell) { return cell.trim(); });
+			if (cells.length && cells[0] === '') {
+				cells.shift();
+			}
+			if (cells.length && cells[cells.length - 1] === '') {
+				cells.pop();
+			}
+			return cells;
+		}
+
+		function isMarkdownSeparatorRow(line) {
+			var cells = splitMarkdownRow(line);
+			if (!cells.length) {
+				return false;
+			}
+			return cells.every(function(cell) {
+				return /^:?-{3,}:?$/.test(cell);
+			});
+		}
+
+		function isTableStart(lines, index) {
+			if (index + 1 >= lines.length) {
+				return false;
+			}
+			if (lines[index].indexOf('|') === -1) {
+				return false;
+			}
+			return isMarkdownSeparatorRow(lines[index + 1]);
+		}
+
+		function appendTextBlock(host, text) {
+			if (!text || !text.trim()) {
+				return;
+			}
+			var block = document.createElement('div');
+			block.className = 'chat-text-block';
+			block.textContent = text;
+			host.appendChild(block);
+		}
+
+		function appendMarkdownTable(host, lines, startIndex) {
+			var headers = splitMarkdownRow(lines[startIndex]);
+			var tableWrap = document.createElement('div');
+			tableWrap.className = 'chat-markdown-table-wrap';
+			var table = document.createElement('table');
+			table.className = 'chat-markdown-table';
+			var thead = document.createElement('thead');
+			var headerRow = document.createElement('tr');
+			headers.forEach(function(headerText) {
+				var th = document.createElement('th');
+				th.textContent = headerText || 'Column';
+				headerRow.appendChild(th);
+			});
+			thead.appendChild(headerRow);
+			table.appendChild(thead);
+
+			var tbody = document.createElement('tbody');
+			var cursor = startIndex + 2;
+			while (cursor < lines.length && lines[cursor].indexOf('|') !== -1 && lines[cursor].trim() !== '') {
+				var rowValues = splitMarkdownRow(lines[cursor]);
+				var tr = document.createElement('tr');
+				for (var i = 0; i < headers.length; i++) {
+					var td = document.createElement('td');
+					td.textContent = rowValues[i] || '';
+					tr.appendChild(td);
+				}
+				tbody.appendChild(tr);
+				cursor += 1;
+			}
+			table.appendChild(tbody);
+			tableWrap.appendChild(table);
+			host.appendChild(tableWrap);
+			return cursor;
+		}
+
+		function renderMessageBody(host, text) {
+			var raw = text || '';
+			var lines = raw.split('\n');
+			var index = 0;
+			var pending = [];
+			while (index < lines.length) {
+				if (isTableStart(lines, index)) {
+					appendTextBlock(host, pending.join('\n'));
+					pending = [];
+					index = appendMarkdownTable(host, lines, index);
+					continue;
+				}
+				pending.push(lines[index]);
+				index += 1;
+			}
+			appendTextBlock(host, pending.join('\n'));
+		}
+
 		function appendMessageToFeed(role, text, meta) {
 			var feed = document.getElementById('chatFeed');
 			var row = document.createElement('div');
@@ -2118,7 +2338,7 @@ def _ui_html() -> str:
 				}
 			}
 			var body = document.createElement('div');
-			body.textContent = text;
+			renderMessageBody(body, text);
 			card.appendChild(body);
 
 			row.appendChild(avatar);
