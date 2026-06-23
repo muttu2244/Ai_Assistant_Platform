@@ -43,6 +43,7 @@ sqlalchemy>=2.0.30
 python-dotenv>=1.0.1
 tenacity>=8.3.0          # retry / backoff
 structlog>=24.2.0         # structured logging
+pypdf>=4.2.0             # PDF text extraction for local file context upload
 
 # Testing
 pytest>=8.2.0

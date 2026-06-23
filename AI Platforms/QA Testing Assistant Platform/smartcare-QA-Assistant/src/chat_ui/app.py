@@ -12,16 +12,20 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import io
 import logging
 from pathlib import Path
 import re
 from typing import Literal
+import xml.etree.ElementTree as ET
+import zipfile
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import uvicorn
 
+from uuid import uuid4
 from src.agents.ado_fetcher.ado_client import AdoClient
 from src.agents.phi_sanitizer.presidio_analyzer import PhiSanitizer
 from src.agents.ai_engine.foundry_client import FoundryClient
@@ -30,8 +34,28 @@ from src.common.config.settings import get_settings
 settings = get_settings()
 logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).resolve().parents[2]
-LANDING_LOGO_PATH = ROOT_DIR / "Streamline_Logo_Gradient.JPG"
+LANDING_LOGO_PATH = ROOT_DIR / "Streamline_Logo_Gradient.jpg"
 
+# Bare-minimum in-memory upload context store (per running process).
+# Structure:
+# {
+#   session_id: [
+#       {
+#           "document_id": str,
+#           "filename": str,
+#           "text": str,
+#           "size_bytes": int,
+#           "uploaded_at": str,
+#       },
+#       ...
+#   ]
+# }
+CONTEXT_STORE: dict[str, list[dict[str, object]]] = {}
+
+ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".docx", ".pdf"}
+MAX_FILE_SIZE_BYTES = 1_000_000  # 1 MB per file
+MAX_FILES_PER_SESSION = 5
+MAX_CONTEXT_CHARS = 40_000
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -60,6 +84,8 @@ class GenerateTestCasesRequest(BaseModel):
 class ChatRequest(BaseModel):
 	message: str = Field(min_length=1)
 	work_item_id: int | None = None
+	session_id: str | None = None
+	include_uploaded_context: bool = True
 
 
 def _ado_is_configured() -> bool:
@@ -76,6 +102,118 @@ def _strip_html(text: str | None) -> str:
 	clean = re.sub(r"\s+", " ", clean).strip()
 	return clean
 
+def _is_allowed_upload(filename: str | None) -> bool:
+    if not filename:
+        return False
+    return Path(filename).suffix.lower() in ALLOWED_UPLOAD_EXTENSIONS
+
+def _sanitize_uploaded_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("\x00", " ")
+    text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+def _trim_context(text: str, max_chars: int = 12000) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + " ...[truncated]"
+
+
+def _extract_docx_text(raw: bytes, filename: str) -> str:
+	try:
+		with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+			xml_bytes = archive.read("word/document.xml")
+	except Exception as exc:
+		raise HTTPException(status_code=400, detail=f"{filename} is not a readable DOCX file") from exc
+
+	try:
+		root = ET.fromstring(xml_bytes)
+	except Exception as exc:
+		raise HTTPException(status_code=400, detail=f"{filename} contains invalid DOCX XML") from exc
+
+	texts: list[str] = []
+	for node in root.iter():
+		if node.tag.endswith("}t") and node.text:
+			texts.append(node.text)
+	return "\n".join(texts)
+
+
+def _extract_pdf_text(raw: bytes, filename: str) -> str:
+	try:
+		from pypdf import PdfReader
+	except Exception as exc:
+		raise HTTPException(
+			status_code=500,
+			detail="PDF upload requires pypdf package. Install it and retry.",
+		) from exc
+
+	try:
+		reader = PdfReader(io.BytesIO(raw))
+		page_texts = []
+		for page in reader.pages:
+			page_texts.append(page.extract_text() or "")
+		return "\n".join(page_texts)
+	except Exception as exc:
+		raise HTTPException(status_code=400, detail=f"{filename} is not a readable PDF file") from exc
+
+async def _read_upload_text(upload_file: UploadFile) -> tuple[str, int]:
+	filename = upload_file.filename or "uploaded_file"
+	suffix = Path(filename).suffix.lower()
+	if not _is_allowed_upload(filename):
+		raise HTTPException(status_code=400, detail=f"Unsupported file type for {filename}")
+
+	raw = await upload_file.read()
+	size_bytes = len(raw)
+	if size_bytes == 0:
+		raise HTTPException(status_code=400, detail=f"{filename} is empty")
+	if size_bytes > MAX_FILE_SIZE_BYTES:
+		raise HTTPException(
+			status_code=400,
+			detail=f"{filename} exceeds max size of {MAX_FILE_SIZE_BYTES} bytes",
+		)
+
+	if suffix == ".docx":
+		text = _extract_docx_text(raw, filename)
+	elif suffix == ".pdf":
+		text = _extract_pdf_text(raw, filename)
+	else:
+		text = raw.decode("utf-8", errors="ignore")
+
+	text = _sanitize_uploaded_text(text)
+	if not text:
+		raise HTTPException(status_code=400, detail=f"{filename} has no readable text content")
+
+	return text, size_bytes
+
+def _build_uploaded_context(session_id: str | None, max_docs: int = 5, max_chars: int = 12000) -> tuple[str, list[str]]:
+    if not session_id:
+        return "", []
+
+    docs = CONTEXT_STORE.get(session_id, [])
+    if not docs:
+        return "", []
+
+    selected = docs[-max_docs:]
+    parts: list[str] = []
+    source_names: list[str] = []
+
+    for doc in selected:
+        filename = str(doc.get("filename", "uploaded_file"))
+        text = _trim_context(str(doc.get("text", "")), max_chars=max_chars // max(1, len(selected)))
+        if not text:
+            continue
+        source_names.append(filename)
+        parts.append(f"Source: {filename}\nContent:\n{text}")
+
+    if not parts:
+        return "", []
+
+    combined = "\n\n---\n\n".join(parts)
+    combined = _trim_context(combined, max_chars=max_chars)
+    return combined, source_names
 
 _NUMBER_WORDS = {
 	"one": 1,
@@ -771,7 +909,14 @@ async def root() -> str:
 
 @app.get("/brand-logo")
 async def brand_logo() -> FileResponse:
-	return FileResponse(LANDING_LOGO_PATH)
+	return FileResponse(
+		LANDING_LOGO_PATH,
+		headers={
+			"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+			"Pragma": "no-cache",
+			"Expires": "0",
+		},
+	)
 
 
 @app.get("/api/status")
@@ -786,6 +931,98 @@ async def api_status() -> dict[str, object]:
 			for feature_name, feature_status in status.items()
 			if feature_status["configured"]
 		],
+	}
+
+@app.post("/api/context/upload")
+async def upload_context_files(
+    files: list[UploadFile] = File(...),
+    session_id: str | None = Form(None),
+) -> dict[str, object]:
+    active_session_id = (session_id or "").strip() or str(uuid4())
+    existing_docs = CONTEXT_STORE.get(active_session_id, [])
+
+    if len(existing_docs) >= MAX_FILES_PER_SESSION:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Session already has max {MAX_FILES_PER_SESSION} files",
+        )
+
+    uploaded_documents: list[dict[str, object]] = []
+
+    for upload in files:
+        # Enforce max files per session
+        if len(existing_docs) + len(uploaded_documents) >= MAX_FILES_PER_SESSION:
+            break
+
+        text, size_bytes = await _read_upload_text(upload)
+        document_id = str(uuid4())
+        record = {
+            "document_id": document_id,
+            "filename": upload.filename or "uploaded_file",
+            "text": text,
+            "size_bytes": size_bytes,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        uploaded_documents.append({
+            "document_id": document_id,
+            "filename": record["filename"],
+            "chars": len(text),
+            "size_bytes": size_bytes,
+        })
+        existing_docs.append(record)
+
+    # Cap total context size in this session (oldest dropped first)
+    total_chars = sum(len(str(d.get("text", ""))) for d in existing_docs)
+    while total_chars > MAX_CONTEXT_CHARS and existing_docs:
+        removed = existing_docs.pop(0)
+        total_chars -= len(str(removed.get("text", "")))
+
+    CONTEXT_STORE[active_session_id] = existing_docs
+
+    return {
+        "session_id": active_session_id,
+        "uploaded_documents": uploaded_documents,
+        "total_documents_in_session": len(existing_docs),
+        "total_context_chars": total_chars,
+    }
+
+
+@app.delete("/api/context/{session_id}/{document_id}")
+async def delete_context_file(session_id: str, document_id: str) -> dict[str, object]:
+	docs = CONTEXT_STORE.get(session_id)
+	if not docs:
+		raise HTTPException(status_code=404, detail="Session context not found")
+
+	remaining = [d for d in docs if str(d.get("document_id")) != document_id]
+	if len(remaining) == len(docs):
+		raise HTTPException(status_code=404, detail="Document not found in session context")
+
+	if remaining:
+		CONTEXT_STORE[session_id] = remaining
+	else:
+		CONTEXT_STORE.pop(session_id, None)
+
+	total_chars = sum(len(str(d.get("text", ""))) for d in remaining)
+	return {
+		"session_id": session_id,
+		"document_id": document_id,
+		"deleted": True,
+		"total_documents_in_session": len(remaining),
+		"total_context_chars": total_chars,
+	}
+
+
+@app.delete("/api/context/{session_id}")
+async def clear_context_files(session_id: str) -> dict[str, object]:
+	if session_id not in CONTEXT_STORE:
+		raise HTTPException(status_code=404, detail="Session context not found")
+
+	CONTEXT_STORE.pop(session_id, None)
+	return {
+		"session_id": session_id,
+		"cleared": True,
+		"total_documents_in_session": 0,
+		"total_context_chars": 0,
 	}
 
 
@@ -1192,6 +1429,11 @@ async def chat(payload: ChatRequest) -> dict[str, object]:
 	extracted_work_item_id = payload.work_item_id or _extract_work_item_id(message)
 	feature_query = _extract_feature_query(message)
 
+	uploaded_context = ""
+	uploaded_sources: list[str] = []
+	if payload.include_uploaded_context:
+		uploaded_context, uploaded_sources = _build_uploaded_context(payload.session_id)
+
 	if _is_testcase_generation_intent(message):
 		requested_count = _extract_requested_count(message)
 		try:
@@ -1249,7 +1491,8 @@ async def chat(payload: ChatRequest) -> dict[str, object]:
 		response = await client.generate(
 			user_prompt=message,
 			feature=feature,
-			conversation_history=None
+			conversation_history=None,
+			context=uploaded_context or None,
 		)
 		return {
 			"assistant_message": response,
@@ -1262,6 +1505,8 @@ async def chat(payload: ChatRequest) -> dict[str, object]:
 				"grounded": False,
 				"presidio_check": "n/a",
 				"sanitization_mode": "n/a",
+				"uploaded_context_used": bool(uploaded_context),
+    			"uploaded_sources": uploaded_sources,
 			},
 		}
 	except Exception as exc:
@@ -1561,6 +1806,33 @@ def _ui_html() -> str:
 			flex-direction:column;
 			gap:12px;
 		}
+		.chat-search-wrap{
+			position:relative;
+		}
+		.chat-search-icon{
+			position:absolute;
+			left:10px;
+			top:50%;
+			transform:translateY(-50%);
+			font-size:13px;
+			color:#7a8da9;
+			pointer-events:none;
+		}
+		.chat-search-input{
+			width:100%;
+			height:38px;
+			border:1px solid var(--line);
+			border-radius:10px;
+			background:#fff;
+			padding:0 12px 0 30px;
+			font-size:13px;
+			color:#334156;
+		}
+		.chat-search-input:focus{
+			outline:none;
+			border-color:#9fb8e8;
+			box-shadow:0 0 0 3px rgba(31,111,235,0.12);
+		}
 		.new-chat{
 			border:none;
 			border-radius:12px;
@@ -1699,7 +1971,72 @@ def _ui_html() -> str:
 		.loading{opacity:0.75;pointer-events:none;}
 		footer.watermark{position:fixed;bottom:10px;right:14px;font-size:11px;color:rgba(38,60,97,0.45);background:rgba(255,255,255,0.75);padding:4px 8px;border-radius:4px;z-index:9999;user-select:none;pointer-events:none;}
 
+		/* Layout theme inspired by the requested automation suite structure */
+		body{background:#ede9f4;}
+		.shell{max-width:none;margin:0;padding:0 0 40px;}
+		.top-strip{display:none;}
+		.logo-bar{
+			width:100%;
+			height:auto;
+			background:#6b0042;
+			border-bottom:none;
+			display:flex;
+			align-items:center;
+			justify-content:flex-start;
+			padding:0 20px;
+		}
+		.logo-bar img{
+			width:auto;
+			height:auto;
+			max-width:100%;
+			object-fit:contain;
+			display:block;
+		}
+		.screen{padding:20px;}
+		.chat-shell{
+			min-height:72vh;
+			border:2px solid #6e2f95;
+			border-radius:12px;
+			box-shadow:none;
+			grid-template-columns:320px 1fr;
+		}
+		.chat-nav{
+			background:#f8f3fc;
+			border-right:2px solid #dcc7ea;
+			padding:14px 12px;
+		}
+		.chat-search-input{border:1px solid #ccb4df;}
+		.chat-search-input:focus{border-color:#8e5bb3;box-shadow:0 0 0 3px rgba(120,57,169,0.16);}
+		.new-chat{background:#0ca06f;font-size:15px;}
+		.chat-section-title{color:#5f3d7c;font-size:11px;}
+		.chat-item{border:1px solid #d9c6e8;}
+		.chat-item.active{border-color:#8e5bb3;background:#efe4f8;color:#3f1f5d;}
+		.chat-main{background:#f4f0f8;min-height:72vh;padding:16px;}
+		.chat-top{
+			border:2px solid #6e2f95;
+			border-radius:10px;
+			background:#fff;
+			padding:12px 16px;
+			margin-bottom:14px;
+		}
+		.chat-top h2{color:#3e1d5a;font-size:30px;}
+		.chat-status{color:#6f3f96;font-size:13px;}
+		.chat-feed{
+			background:#ffffff;
+			border:1px solid #d7c5e7;
+			border-radius:10px;
+			padding:18px;
+		}
+		.chat-input-wrap{
+			margin-top:12px;
+			border:1px solid #d7c5e7;
+			border-radius:10px;
+			background:#fff;
+		}
+		.send{background:linear-gradient(120deg,#6c1f99,#5a1884);}
+
 		@media (max-width:1024px){
+			.chat-top h2{font-size:24px;}
 			.home-title{font-size:44px;}
 			.home-copy{font-size:20px;}
 			.mode-btn{font-size:22px;min-width:220px;}
@@ -1709,9 +2046,11 @@ def _ui_html() -> str:
 		}
 
 		@media (max-width:900px){
+			.logo-bar{max-width:100%;}
+			.logo-bar img{max-width:100%;height:auto;}
 			.action-grid{grid-template-columns:1fr;}
 			.chat-shell{grid-template-columns:1fr;}
-			.chat-nav{display:none;}
+			.chat-nav{border-right:none;border-bottom:1px solid #dcc7ea;}
 			.shell{padding:18px 10px 80px;}
 			.card-head{padding:14px;}
 			.home-body{padding:28px 16px;}
@@ -1730,17 +2069,13 @@ def _ui_html() -> str:
 </head>
 <body>
 	<main class="shell">
-		<div class="top-strip">
-			<div class="top-brand"><span class="orb"></span>SmartCare QA Assistant</div>
-			<div class="muted">AI-powered testing companion</div>
+		<div class="logo-bar">
+			<img src="/brand-logo" alt="Streamline Healthcare"/>
 		</div>
-
 		<section id="homeView" class="screen active">
 			<article class="card">
 				<div class="card-head">
-					<div class="brand-lockup">
-						<img class="brand-logo" src="/brand-logo" alt="Streamline Healthcare logo"/>
-					</div>
+					<div class="brand-lockup"></div>
 					<button class="ghost-btn" onclick="showView('keyword')">Open Workspace</button>
 				</div>
 
@@ -1750,7 +2085,8 @@ def _ui_html() -> str:
 
 					<div class="mode-switch">
 						<button class="mode-btn active" id="goFreeTextHome" onclick="showView('freetext')">Free Text View</button>
-						<button class="mode-btn" id="goKeywordHome" onclick="showView('keyword')">Keyword View</button>
+						<!--<button class="mode-btn" id="goKeywordHome" onclick="showView('keyword')">Keyword View</button> -->
+						<button class="mode-btn" id="goKeywordHome" onclick="return false;" disabled>Keyword View</button>
 					</div>
 
 					<div class="hero-art">
@@ -1760,7 +2096,7 @@ def _ui_html() -> str:
 			</article>
 		</section>
 
-		<section id="keywordView" class="screen">
+		<section id="keywordView" class="screen" style="display: none;">
 			<article class="card frame">
 				<div class="bar">
 					<div style="display:flex;align-items:center;gap:10px;">
@@ -1811,15 +2147,18 @@ def _ui_html() -> str:
 		<section id="freetextView" class="screen">
 			<article class="chat-shell">
 				<aside class="chat-nav">
-					<button class="new-chat" onclick="startNewChatSession()">+ New Chat</button>
-					<div class="chat-section-title">History</div>
+					<div class="chat-search-wrap">
+						<span class="chat-search-icon" aria-hidden="true">&#128269;</span>
+						<input id="chatHistorySearch" class="chat-search-input" type="text" placeholder="Search chats" oninput="renderChatHistory()"/>
+					</div>
+					<button class="new-chat" onclick="startNewChatSession()">+ New QA Chat</button>
+					<div class="chat-section-title">Chat Sessions</div>
 					<div id="chatHistory" class="chat-history"></div>
 					<button class="ghost-btn" onclick="showView('home')">Back to Home</button>
 				</aside>
 
 				<div class="chat-main">
 					<div class="chat-top">
-						<h2>Free Text View</h2>
 						<div class="chat-status">Live Assistant</div>
 					</div>
 
@@ -1827,8 +2166,14 @@ def _ui_html() -> str:
 
 					<div class="chat-input-wrap">
 						<div class="composer">
+							<button id="attachBtn" class="send" type="button" onclick="triggerContextUpload()" title="Attach files">+</button>
+							<input id="contextFileInput" type="file" accept=".txt,.md,.csv,.json,.docx,.pdf" multiple style="display:none" onchange="handleContextFilesSelected(event)"/>
 							<textarea id="chatInput" placeholder="Message QA AI Assistant..."></textarea>
 							<button id="sendBtn" class="send" onclick="sendChat()">Send</button>
+						</div>
+						<div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;gap:10px;">
+							<div id="attachedFiles" class="muted" style="font-size:12px;flex:1;"></div>
+							<button id="clearAttachedBtn" class="ghost-btn" type="button" style="display:none;padding:4px 10px;font-size:12px;" onclick="clearAllAttachedFiles()">Clear all</button>
 						</div>
 					</div>
 				</div>
@@ -1839,12 +2184,12 @@ def _ui_html() -> str:
 	<script>
 		function showView(view) {
 			document.getElementById('homeView').classList.toggle('active', view === 'home');
-			document.getElementById('keywordView').classList.toggle('active', view === 'keyword');
+			// document.getElementById('keywordView').classList.toggle('active', view === 'keyword');
 			document.getElementById('freetextView').classList.toggle('active', view === 'freetext');
 			document.getElementById('goFreeTextHome').classList.toggle('active', view === 'freetext');
 			document.getElementById('goKeywordHome').classList.toggle('active', view !== 'freetext');
 		}
-
+		/*
 		function parseTicketIds() {
 			var raw = (document.getElementById('ticketInput').value || '').trim();
 			if (!raw) {
@@ -1852,7 +2197,7 @@ def _ui_html() -> str:
 			}
 			return raw.split(',').map(function(part){ return part.trim(); }).filter(Boolean);
 		}
-
+		*/		
 		function parseNumericWorkItemIds(ticketIds) {
 			return (ticketIds || []).map(function(ticket) {
 				var match = String(ticket).match(/(\d{3,9})/);
@@ -1952,7 +2297,7 @@ def _ui_html() -> str:
 				detail_lines: perItemLines,
 			};
 		}
-
+		/*
 		async function runKeywordAction(action) {
 			var ids = parseTicketIds();
 			var numericIds = parseNumericWorkItemIds(ids);
@@ -2043,10 +2388,12 @@ def _ui_html() -> str:
 				setKeywordLoading(false);
 			}
 		}
-
+		*/
 		var CHAT_STORAGE_KEY = 'smartcare_chat_sessions_v1';
+		var CHAT_CONTEXT_STORAGE_KEY = 'smartcare_chat_context_v1';
 		var chatSessions = [];
 		var currentChatId = null;
+		var chatContextBySession = {};
 
 		function newSessionTitle() {
 			return 'New QA Chat';
@@ -2103,12 +2450,39 @@ def _ui_html() -> str:
 			}
 		}
 
+		function saveChatContextState() {
+			try {
+				localStorage.setItem(CHAT_CONTEXT_STORAGE_KEY, JSON.stringify(chatContextBySession));
+			} catch (err) {
+				console.warn('Unable to persist chat context state:', err);
+			}
+		}
+
+		function loadChatContextState() {
+			try {
+				var raw = localStorage.getItem(CHAT_CONTEXT_STORAGE_KEY);
+				if (!raw) {
+					return {};
+				}
+				var parsed = JSON.parse(raw);
+				if (!parsed || typeof parsed !== 'object') {
+					return {};
+				}
+				return parsed;
+			} catch (err) {
+				console.warn('Unable to load chat context state:', err);
+				return {};
+			}
+		}
+
 		function getCurrentSession() {
 			return chatSessions.find(function(session) { return session.id === currentChatId; }) || null;
 		}
 
 		function renderChatHistory() {
 			var host = document.getElementById('chatHistory');
+			var searchEl = document.getElementById('chatHistorySearch');
+			var query = searchEl ? String(searchEl.value || '').trim().toLowerCase() : '';
 			if (!host) {
 				return;
 			}
@@ -2122,9 +2496,28 @@ def _ui_html() -> str:
 				return;
 			}
 
-			chatSessions.slice().sort(function(a, b) {
+			var sortedSessions = chatSessions.slice().sort(function(a, b) {
 				return String(b.updatedAt).localeCompare(String(a.updatedAt));
-			}).forEach(function(session) {
+			});
+
+			var visibleSessions = sortedSessions.filter(function(session) {
+				if (!query) {
+					return true;
+				}
+				var title = String(session.title || newSessionTitle()).toLowerCase();
+				return title.indexOf(query) !== -1;
+			});
+
+			if (!visibleSessions.length) {
+				var noMatch = document.createElement('div');
+				noMatch.className = 'chat-item';
+				noMatch.style.opacity = '0.75';
+				noMatch.textContent = 'No matching chats.';
+				host.appendChild(noMatch);
+				return;
+			}
+
+			visibleSessions.forEach(function(session) {
 				var item = document.createElement('div');
 				item.className = 'chat-item' + (session.id === currentChatId ? ' active' : '');
 				item.textContent = session.title || newSessionTitle();
@@ -2140,15 +2533,238 @@ def _ui_html() -> str:
 			var session = getCurrentSession();
 			if (!session) {
 				appendMessageToFeed('assistant', 'Select a chat from History or click + New Chat to begin.');
+				renderAttachedFiles();
 				return;
 			}
 			if (!session.messages.length) {
 				appendMessageToFeed('assistant', 'New chat started. Share your QA request and I will help with test design, coverage gaps, and automation guidance.');
+				renderAttachedFiles();
 				return;
 			}
 			session.messages.forEach(function(msg) {
 				appendMessageToFeed(msg.role, msg.text, msg.meta || null);
 			});
+			renderAttachedFiles();
+		}
+
+		function getCurrentContextState() {
+			if (!currentChatId) {
+				return null;
+			}
+			if (!chatContextBySession[currentChatId]) {
+				chatContextBySession[currentChatId] = {
+					sessionId: null,
+					uploadedDocuments: []
+				};
+				saveChatContextState();
+			}
+			return chatContextBySession[currentChatId];
+		}
+
+		function renderAttachedFiles() {
+			var host = document.getElementById('attachedFiles');
+			var clearBtn = document.getElementById('clearAttachedBtn');
+			if (!host) {
+				return;
+			}
+			var state = getCurrentContextState();
+			if (!state || !state.uploadedDocuments || !state.uploadedDocuments.length) {
+				host.innerHTML = '';
+				if (clearBtn) {
+					clearBtn.style.display = 'none';
+				}
+				return;
+			}
+			if (clearBtn) {
+				clearBtn.style.display = 'inline-block';
+			}
+
+			host.innerHTML = '';
+			var label = document.createElement('span');
+			label.textContent = 'Attached: ';
+			host.appendChild(label);
+
+			state.uploadedDocuments.forEach(function(doc) {
+				var chip = document.createElement('span');
+				chip.style.display = 'inline-flex';
+				chip.style.alignItems = 'center';
+				chip.style.gap = '6px';
+				chip.style.margin = '0 6px 6px 0';
+				chip.style.padding = '2px 8px';
+				chip.style.border = '1px solid #d7c5e7';
+				chip.style.borderRadius = '999px';
+				chip.style.background = '#fff';
+
+				var text = document.createElement('span');
+				text.textContent = doc.filename || 'uploaded_file';
+				chip.appendChild(text);
+
+				var closeBtn = document.createElement('button');
+				closeBtn.type = 'button';
+				closeBtn.textContent = '×';
+				closeBtn.title = 'Remove from chat context';
+				closeBtn.style.border = 'none';
+				closeBtn.style.background = 'transparent';
+				closeBtn.style.cursor = 'pointer';
+				closeBtn.style.fontSize = '14px';
+				closeBtn.style.lineHeight = '1';
+				closeBtn.onclick = function() {
+					removeAttachedDocument(String(doc.document_id || ''));
+				};
+				chip.appendChild(closeBtn);
+				host.appendChild(chip);
+			});
+		}
+
+		async function removeAttachedDocument(documentId) {
+			if (!documentId) {
+				return;
+			}
+			var state = getCurrentContextState();
+			if (!state) {
+				return;
+			}
+			if (!confirm('Remove this file from chat context?')) {
+				return;
+			}
+
+			try {
+				if (state.sessionId) {
+					var res = await fetch('/api/context/' + encodeURIComponent(state.sessionId) + '/' + encodeURIComponent(documentId), {
+						method: 'DELETE'
+					});
+					if (!res.ok) {
+						var data = await res.json();
+						throw new Error(data && data.detail ? data.detail : 'Delete failed');
+					}
+				}
+
+				state.uploadedDocuments = (state.uploadedDocuments || []).filter(function(doc) {
+					return String(doc.document_id || '') !== documentId;
+				});
+				saveChatContextState();
+				renderAttachedFiles();
+			} catch (err) {
+				addChatMessage('assistant', 'Could not remove attached file: ' + String(err), {
+					source: 'context_upload_error',
+					grounded: false,
+					presidio_check: 'unknown',
+					sanitization_mode: 'unknown'
+				});
+			}
+		}
+
+		async function clearAllAttachedFiles() {
+			var state = getCurrentContextState();
+			if (!state || !state.uploadedDocuments || !state.uploadedDocuments.length) {
+				return;
+			}
+			if (!confirm('Remove all attached files from this chat context?')) {
+				return;
+			}
+
+			try {
+				if (state.sessionId) {
+					var res = await fetch('/api/context/' + encodeURIComponent(state.sessionId), {
+						method: 'DELETE'
+					});
+					if (!res.ok) {
+						var data = await res.json();
+						throw new Error(data && data.detail ? data.detail : 'Clear failed');
+					}
+				}
+
+				state.uploadedDocuments = [];
+				state.sessionId = null;
+				saveChatContextState();
+				renderAttachedFiles();
+			} catch (err) {
+				addChatMessage('assistant', 'Could not clear attachments: ' + String(err), {
+					source: 'context_upload_error',
+					grounded: false,
+					presidio_check: 'unknown',
+					sanitization_mode: 'unknown'
+				});
+			}
+		}
+
+		function triggerContextUpload() {
+			var picker = document.getElementById('contextFileInput');
+			if (!picker) {
+				return;
+			}
+			picker.click();
+		}
+
+		async function handleContextFilesSelected(event) {
+			var picker = event && event.target ? event.target : document.getElementById('contextFileInput');
+			if (!picker || !picker.files || !picker.files.length) {
+				return;
+			}
+
+			var session = getCurrentSession();
+			if (!session) {
+				startNewChatSession();
+				session = getCurrentSession();
+			}
+
+			var state = getCurrentContextState();
+			if (!state) {
+				picker.value = '';
+				return;
+			}
+
+			var attachBtn = document.getElementById('attachBtn');
+			if (attachBtn) {
+				attachBtn.disabled = true;
+				attachBtn.textContent = '...';
+			}
+
+			var formData = new FormData();
+			Array.from(picker.files).forEach(function(file) {
+				formData.append('files', file);
+			});
+			if (state.sessionId) {
+				formData.append('session_id', state.sessionId);
+			}
+
+			try {
+				var res = await fetch('/api/context/upload', {
+					method: 'POST',
+					body: formData
+				});
+				var data = await res.json();
+				if (!res.ok) {
+					throw new Error(data && data.detail ? data.detail : 'Upload failed');
+				}
+
+				state.sessionId = data.session_id || state.sessionId;
+				var uploaded = Array.isArray(data.uploaded_documents) ? data.uploaded_documents : [];
+				uploaded.forEach(function(doc) {
+					state.uploadedDocuments.push(doc);
+				});
+				saveChatContextState();
+				renderAttachedFiles();
+				addChatMessage('assistant', 'Uploaded ' + uploaded.length + ' file(s) and attached them to this chat context.', {
+					source: 'context_upload',
+					grounded: false,
+					presidio_check: 'n/a',
+					sanitization_mode: 'n/a'
+				});
+			} catch (err) {
+				addChatMessage('assistant', 'File upload failed: ' + String(err), {
+					source: 'context_upload_error',
+					grounded: false,
+					presidio_check: 'unknown',
+					sanitization_mode: 'unknown'
+				});
+			} finally {
+				if (attachBtn) {
+					attachBtn.disabled = false;
+					attachBtn.textContent = '+';
+				}
+				picker.value = '';
+			}
 		}
 
 		function selectChatSession(sessionId) {
@@ -2159,6 +2775,12 @@ def _ui_html() -> str:
 		}
 
 		function startNewChatSession() {
+			var current = getCurrentSession();
+			if (current && (!current.messages || current.messages.length === 0)) {
+				showView('freetext');
+				return;
+			}
+
 			var session = createChatSession(newSessionTitle());
 			chatSessions.push(session);
 			currentChatId = session.id;
@@ -2214,6 +2836,12 @@ def _ui_html() -> str:
 			}
 			if (meta.sanitization_mode) {
 				pills.push('Mode: ' + meta.sanitization_mode);
+			}
+			if (typeof meta.uploaded_context_used === 'boolean') {
+				pills.push('Upload Context: ' + (meta.uploaded_context_used ? 'Yes' : 'No'));
+			}
+			if (Array.isArray(meta.uploaded_sources) && meta.uploaded_sources.length) {
+				pills.push('Sources: ' + meta.uploaded_sources.join(', '));
 			}
 			return pills;
 		}
@@ -2369,12 +2997,17 @@ def _ui_html() -> str:
 			var sendBtn = document.getElementById('sendBtn');
 			sendBtn.disabled = true;
 			sendBtn.textContent = 'Sending...';
+			var contextState = getCurrentContextState();
 
 			try {
 				var res = await fetch('/api/chat', {
 					method: 'POST',
 					headers: {'Content-Type': 'application/json'},
-					body: JSON.stringify({message: text})
+					body: JSON.stringify({
+						message: text,
+						session_id: contextState && contextState.sessionId ? contextState.sessionId : null,
+						include_uploaded_context: true
+					})
 				});
 				var data = await res.json();
 				addChatMessage('assistant', data.assistant_message || 'No response available.', data.response_meta || null);
@@ -2400,6 +3033,7 @@ def _ui_html() -> str:
 		showView('home');
 		setKeywordPresidioStatus(null, null, 'not-run');
 		chatSessions = loadChatSessions();
+		chatContextBySession = loadChatContextState();
 		currentChatId = null;
 		renderChatHistory();
 		renderChatFeed();
