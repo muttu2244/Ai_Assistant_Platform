@@ -11,3 +11,16 @@ build/
 __pycache__/
 *.pyc
 .pytest_cache/
+
+.chat_context_store.sqlite3
+.chat_context_uploads/
+__pycache__/
+*.pyc
+
+__pycache__/
+*.pyc
+
+__pycache__/
+*.pyc
+__pycache__/
+*.pyc

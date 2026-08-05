@@ -44,9 +44,15 @@ python-dotenv>=1.0.1
 tenacity>=8.3.0          # retry / backoff
 structlog>=24.2.0         # structured logging
 pypdf>=4.2.0             # PDF text extraction for local file context upload
+openpyxl>=3.1.5          # Excel workbook reader/writer for MSP mapping scripts
 
 # Testing
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
 pytest-mock>=3.14.0
 httpx                     # also used in tests via httpx.AsyncClient
+
+numpy
+scikit-learn
+xgboost
+pandas

@@ -10,12 +10,18 @@ Provides a local, demo-friendly UI with meaningful QA workflows:
 
 from __future__ import annotations
 
+import asyncio
+import csv
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import io
 import logging
 from pathlib import Path
 import re
+import sqlite3
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
 from typing import Literal
 import xml.etree.ElementTree as ET
 import zipfile
@@ -35,30 +41,100 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 ROOT_DIR = Path(__file__).resolve().parents[2]
 LANDING_LOGO_PATH = ROOT_DIR / "Streamline_Logo_Gradient.jpg"
-
-# Bare-minimum in-memory upload context store (per running process).
-# Structure:
-# {
-#   session_id: [
-#       {
-#           "document_id": str,
-#           "filename": str,
-#           "text": str,
-#           "size_bytes": int,
-#           "uploaded_at": str,
-#       },
-#       ...
-#   ]
-# }
-CONTEXT_STORE: dict[str, list[dict[str, object]]] = {}
+UPLOAD_CONTEXT_DIR = ROOT_DIR / ".chat_context_uploads"
+UPLOAD_CONTEXT_DB_PATH = ROOT_DIR / ".chat_context_store.sqlite3"
 
 ALLOWED_UPLOAD_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".docx", ".pdf"}
-MAX_FILE_SIZE_BYTES = 1_000_000  # 1 MB per file
+MAX_FILE_SIZE_BYTES = 5_000_000  # 5 MB per file
 MAX_FILES_PER_SESSION = 5
-MAX_CONTEXT_CHARS = 40_000
+MAX_CONTEXT_CHARS = 150_000
+MAX_CONTEXT_CHARS_PER_FILE = max(20_000, MAX_CONTEXT_CHARS // max(1, MAX_FILES_PER_SESSION))
+
+DEFAULT_TICKET_EXPORT_CSV = ROOT_DIR / "poc_ado_query_results.csv"
+DEFAULT_FEATURE_MODULE_CSV = ROOT_DIR / "msp_feature_module_mapping.csv"
+DEFAULT_MODULE_SUMMARY_CSV = ROOT_DIR / "bug_ticket_feature_module_recurrence_summary.csv"
+DEFAULT_FUNCTIONALITY_SUMMARY_CSV = ROOT_DIR / "bug_ticket_functionality_summary.csv"
+DEFAULT_RECURRENCE_OUTPUT_CSV = ROOT_DIR / "probable_recurrence_candidates.csv"
+DEFAULT_RECENT_WINDOW_DAYS = 60
+DEFAULT_MSP_SHEET_NAME = "6.0_1-AprilMSP_2026"
+DEFAULT_MSP_TARGET_CATEGORY = "Engineering Improvement Initiatives- NBL(I)"
+
+# In-memory progress tracker for long-running predictive E2E runs.
+PREDICTIVE_RUN_STATUS: dict[str, dict[str, object]] = {}
+
+
+def _set_predictive_run_status(run_id: str, state: str, step: str, message: str) -> None:
+	PREDICTIVE_RUN_STATUS[run_id] = {
+		"run_id": run_id,
+		"state": state,
+		"step": step,
+		"message": message,
+		"updated_at": datetime.now(timezone.utc).isoformat(),
+	}
+
+
+def _context_db_connection() -> sqlite3.Connection:
+	conn = sqlite3.connect(str(UPLOAD_CONTEXT_DB_PATH))
+	conn.row_factory = sqlite3.Row
+	return conn
+
+
+def _init_context_store() -> None:
+	UPLOAD_CONTEXT_DIR.mkdir(parents=True, exist_ok=True)
+	with _context_db_connection() as conn:
+		conn.execute(
+			"""
+			CREATE TABLE IF NOT EXISTS uploaded_context_documents (
+				document_id TEXT PRIMARY KEY,
+				session_id TEXT NOT NULL,
+				filename TEXT NOT NULL,
+				storage_path TEXT NOT NULL,
+				size_bytes INTEGER NOT NULL,
+				char_count INTEGER NOT NULL,
+				uploaded_at TEXT NOT NULL
+			)
+			"""
+		)
+		conn.execute(
+			"""
+			CREATE INDEX IF NOT EXISTS idx_uploaded_context_session
+			ON uploaded_context_documents (session_id, uploaded_at)
+			"""
+		)
+
+
+def _fetch_context_docs(session_id: str) -> list[sqlite3.Row]:
+	with _context_db_connection() as conn:
+		rows = conn.execute(
+			"""
+			SELECT document_id, session_id, filename, storage_path, size_bytes, char_count, uploaded_at
+			FROM uploaded_context_documents
+			WHERE session_id = ?
+			ORDER BY uploaded_at ASC
+			""",
+			(session_id,),
+		).fetchall()
+	return rows
+
+
+def _delete_context_document(document_id: str) -> None:
+	with _context_db_connection() as conn:
+		row = conn.execute(
+			"SELECT storage_path FROM uploaded_context_documents WHERE document_id = ?",
+			(document_id,),
+		).fetchone()
+		if row is None:
+			return
+		storage_path = Path(str(row["storage_path"]))
+		conn.execute("DELETE FROM uploaded_context_documents WHERE document_id = ?", (document_id,))
+	try:
+		storage_path.unlink(missing_ok=True)
+	except Exception:
+		logger.warning("Failed to delete context file for document_id=%s", document_id)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+	_init_context_store()
 	yield
 	# Clean shutdown: cancel any lingering tasks so Ctrl+C is immediate
 	import asyncio
@@ -188,32 +264,51 @@ async def _read_upload_text(upload_file: UploadFile) -> tuple[str, int]:
 
 	return text, size_bytes
 
-def _build_uploaded_context(session_id: str | None, max_docs: int = 5, max_chars: int = 12000) -> tuple[str, list[str]]:
-    if not session_id:
-        return "", []
+def _build_uploaded_context(session_id: str | None, max_docs: int = 5, max_chars: int | None = None) -> tuple[str, list[str]]:
+	if not session_id:
+		return "", []
 
-    docs = CONTEXT_STORE.get(session_id, [])
-    if not docs:
-        return "", []
+	if max_chars is None:
+		max_chars = min(MAX_CONTEXT_CHARS, 60_000)
 
-    selected = docs[-max_docs:]
-    parts: list[str] = []
-    source_names: list[str] = []
+	docs = _fetch_context_docs(session_id)
+	if not docs:
+		return "", []
 
-    for doc in selected:
-        filename = str(doc.get("filename", "uploaded_file"))
-        text = _trim_context(str(doc.get("text", "")), max_chars=max_chars // max(1, len(selected)))
-        if not text:
-            continue
-        source_names.append(filename)
-        parts.append(f"Source: {filename}\nContent:\n{text}")
+	selected = docs[-max_docs:]
+	parts: list[str] = []
+	source_names: list[str] = []
+	manifest_names = [str(doc["filename"] or "uploaded_file") for doc in selected]
+	manifest = "Attached Sources: " + ", ".join(manifest_names)
 
-    if not parts:
-        return "", []
+	# Reserve room for source manifest and separators, then split remaining budget across files.
+	separator_overhead = max(0, (len(selected) - 1) * len("\n\n---\n\n"))
+	header_overhead = sum(len(f"Source: {name}\nContent:\n") for name in manifest_names)
+	reserved = len(manifest) + 8 + separator_overhead + header_overhead
+	remaining_budget = max(4000, max_chars - reserved)
+	per_doc_budget = max(1200, remaining_budget // max(1, len(selected)))
 
-    combined = "\n\n---\n\n".join(parts)
-    combined = _trim_context(combined, max_chars=max_chars)
-    return combined, source_names
+	for doc in selected:
+		filename = str(doc["filename"] or "uploaded_file")
+		storage_path = Path(str(doc["storage_path"]))
+		if not storage_path.exists():
+			continue
+		try:
+			text = storage_path.read_text(encoding="utf-8")
+		except Exception:
+			continue
+		text = _trim_context(text, max_chars=per_doc_budget)
+		if not text:
+			continue
+		source_names.append(filename)
+		parts.append(f"Source: {filename}\nContent:\n{text}")
+
+	if not parts:
+		return "", []
+
+	combined = manifest + "\n\n" + "\n\n---\n\n".join(parts)
+	combined = _trim_context(combined, max_chars=max_chars)
+	return combined, source_names
 
 _NUMBER_WORDS = {
 	"one": 1,
@@ -902,6 +997,758 @@ def _mock_sprint_summary() -> dict[str, object]:
 	}
 
 
+def _normalize_key(value: str) -> str:
+	return re.sub(r"[^a-z0-9]+", "", (value or "").strip().lower())
+
+
+def _safe_int(value: object, default: int = 0) -> int:
+	try:
+		return int(float(str(value)))
+	except Exception:
+		return default
+
+
+def _split_ticket_ids(value: str) -> list[str]:
+	if not value:
+		return []
+	return [chunk.strip() for chunk in str(value).split(";") if chunk.strip()]
+
+
+def _read_csv_rows_from_path(path: Path) -> list[dict[str, str]]:
+	if not path.exists():
+		return []
+	with path.open("r", encoding="utf-8-sig", newline="") as handle:
+		reader = csv.DictReader(handle)
+		return [{str(k): str(v or "").strip() for k, v in row.items()} for row in reader]
+
+
+async def _read_csv_rows_from_upload(upload: UploadFile | None) -> list[dict[str, str]]:
+	if upload is None:
+		return []
+	filename = upload.filename or "uploaded.csv"
+	if Path(filename).suffix.lower() not in {".csv", ".txt"}:
+		raise HTTPException(
+			status_code=400,
+			detail=f"{filename} must be a CSV file (.csv).",
+		)
+	raw = await upload.read()
+	if not raw:
+		return []
+
+	# Decode with BOM-safe UTF-8 first; fallback keeps endpoint resilient.
+	try:
+		text = raw.decode("utf-8-sig")
+	except UnicodeDecodeError:
+		text = raw.decode("latin-1", errors="ignore")
+
+	# Normalize line endings to reduce parser failures on mixed newline files.
+	text = text.replace("\r\n", "\n").replace("\r", "\n")
+	if not text.strip():
+		return []
+
+	# Heuristic delimiter detection from header line.
+	header_line = text.split("\n", 1)[0]
+	delimiter_candidates = [",", ";", "\t", "|"]
+	delimiter = max(delimiter_candidates, key=lambda candidate: header_line.count(candidate))
+
+	try:
+		reader = csv.DictReader(io.StringIO(text, newline=""), delimiter=delimiter)
+		return [{str(k): str(v or "").strip() for k, v in row.items()} for row in reader]
+	except csv.Error as exc:
+		raise HTTPException(
+			status_code=400,
+			detail=(
+				f"Unable to parse {filename} as CSV. "
+				"Please save it as a standard CSV with quoted values when fields contain new lines."
+			),
+		) from exc
+
+
+def _get_value(row: dict[str, str], candidates: tuple[str, ...]) -> str:
+	normalized = {_normalize_key(key): value for key, value in row.items()}
+	for candidate in candidates:
+		value = normalized.get(_normalize_key(candidate), "")
+		if value:
+			return value
+	return ""
+
+
+def _risk_band(count: int) -> str:
+	if count >= 50:
+		return "High"
+	if count >= 15:
+		return "Medium"
+	if count > 0:
+		return "Low"
+	return "None"
+
+
+def _write_dict_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+	with path.open("w", encoding="utf-8-sig", newline="") as handle:
+		writer = csv.DictWriter(handle, fieldnames=fieldnames)
+		writer.writeheader()
+		writer.writerows(rows)
+
+
+def _parse_changed_age_days(changed_date: str) -> int | None:
+	if not changed_date:
+		return None
+	text = changed_date.strip()
+	if not text:
+		return None
+	text = text.replace("Z", "+00:00")
+	try:
+		dt = datetime.fromisoformat(text)
+		if dt.tzinfo is None:
+			dt = dt.replace(tzinfo=timezone.utc)
+		age_days = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).days
+		return max(0, age_days)
+	except Exception:
+		return None
+
+
+def _run_python_command(command: list[str], stage: str) -> str:
+	try:
+		proc = subprocess.run(command, capture_output=True, text=True, cwd=str(ROOT_DIR), check=False)
+	except Exception as exc:
+		raise HTTPException(status_code=500, detail=f"{stage} failed to start: {exc}") from exc
+
+	if proc.returncode != 0:
+		stderr = (proc.stderr or "").strip()
+		stdout = (proc.stdout or "").strip()
+		combined = "\n".join(part for part in (stderr, stdout) if part)
+		if not combined:
+			combined = f"exit code {proc.returncode}"
+		# Preserve the tail where Python tracebacks usually end to expose root cause.
+		message = combined[-2000:]
+		raise HTTPException(status_code=500, detail=f"{stage} failed (exit {proc.returncode}): {message}")
+
+	return (proc.stdout or "").strip()
+
+
+def _derive_modified_functions_from_feature_rows(feature_rows: list[dict[str, str]]) -> list[dict[str, str]]:
+	seen: set[str] = set()
+	derived: list[dict[str, str]] = []
+	for row in feature_rows:
+		functionality = _get_value(row, ("functionality", "feature_functionality")).strip()
+		if not functionality:
+			continue
+		key = _normalize_key(functionality)
+		if not key or key in seen:
+			continue
+		seen.add(key)
+		derived.append({"modified_functionality": functionality})
+	return derived
+
+
+def _compute_predictive_outputs(
+	module_summary_rows: list[dict[str, str]],
+	functionality_summary_rows: list[dict[str, str]],
+	feature_module_rows: list[dict[str, str]],
+	dependency_rows: list[dict[str, str]],
+	modified_function_rows: list[dict[str, str]],
+	ticket_rows: list[dict[str, str]],
+	output_csv_path: Path,
+	recent_window_days: int = DEFAULT_RECENT_WINDOW_DAYS,
+	top_score_levels: int = 50,
+) -> dict[str, object]:
+	# Keep feature counts from module summary, but derive module ticket counts from
+	# functionality assignments so both UI sections use the same ticket basis.
+	module_feature_counts: dict[str, int] = {}
+	for row in module_summary_rows:
+		module_name = _get_value(row, ("module_name", "module"))
+		if not module_name:
+			continue
+		module_feature_counts[module_name] = _safe_int(_get_value(row, ("feature_count",)))
+
+	functionality_to_ids: dict[str, list[str]] = {}
+	functionality_to_module: dict[str, str] = {}
+	functionality_to_count: dict[str, int] = {}
+	module_to_unique_ticket_ids: dict[str, set[str]] = {}
+	for row in functionality_summary_rows:
+		func = _get_value(row, ("functionality", "feature_functionality"))
+		module_name = _get_value(row, ("module_name", "module"))
+		ids = _split_ticket_ids(_get_value(row, ("bug_cust_ticket_ids", "bug_ticket_ids")))
+		count = _safe_int(_get_value(row, ("bug_cust_ticket_count", "bug_ticket_count", "count")), default=len(ids))
+		if not func:
+			continue
+		functionality_to_ids[func] = ids
+		functionality_to_count[func] = count
+		functionality_to_module[func] = module_name
+		if module_name:
+			module_to_unique_ticket_ids.setdefault(module_name, set()).update(ids)
+
+	module_cards = []
+	for module_name in sorted(set(module_feature_counts) | set(module_to_unique_ticket_ids)):
+		module_cards.append(
+			{
+				"module_name": module_name,
+				"ticket_count": len(module_to_unique_ticket_ids.get(module_name, set())),
+				"feature_count": module_feature_counts.get(module_name, 0),
+			}
+		)
+	module_cards.sort(key=lambda item: item["ticket_count"], reverse=True)
+
+	functionality_to_features: dict[str, set[str]] = {}
+	for row in feature_module_rows:
+		func = _get_value(row, ("functionality", "feature_functionality"))
+		feature_name = _get_value(row, ("title", "feature_name"))
+		if not func:
+			continue
+		functionality_to_features.setdefault(func, set())
+		if feature_name:
+			functionality_to_features[func].add(feature_name)
+
+	functionality_lookup: dict[str, str] = {
+		_normalize_key(func): func
+		for func in functionality_to_ids
+		if _normalize_key(func)
+	}
+
+	def _resolve_functionality_name(name: str) -> str:
+		key = _normalize_key(name)
+		if not key:
+			return ""
+		return functionality_lookup.get(key, name.strip())
+
+	dependency_map: dict[str, set[str]] = {}
+	for row in dependency_rows:
+		source = _get_value(
+			row,
+			(
+				"source_functionality",
+				"functionality",
+				"function",
+				"from_function",
+				"from",
+				"function_code",
+				"source_function",
+			),
+		)
+		target = _get_value(
+			row,
+			(
+				"depends_on_functionality",
+				"dependent_functionality",
+				"depends_on",
+				"to_function",
+				"to",
+				"depend_code",
+				"dependent_code",
+				"target_function",
+			),
+		)
+		source = _resolve_functionality_name(source)
+		target = _resolve_functionality_name(target)
+		if source and target:
+			dependency_map.setdefault(source, set()).add(target)
+
+	modified_functions: set[str] = set()
+	for row in modified_function_rows:
+		val = _get_value(
+			row,
+			(
+				"modified_functionality",
+				"modified_function",
+				"functionality",
+				"function",
+			),
+		)
+		if val:
+			modified_functions.add(_resolve_functionality_name(val))
+
+	if not modified_functions:
+		# Fallback to top active functionalities from summary when no explicit MSP change list is provided.
+		ranked = sorted(
+			functionality_to_count.items(),
+			key=lambda item: item[1],
+			reverse=True,
+		)
+		modified_functions = {name for name, _ in ranked[:8]}
+
+	ticket_meta: dict[str, dict[str, str]] = {}
+	for row in ticket_rows:
+		ticket_id = _get_value(row, ("id", "ticket_id", "bug_ticket_id")).strip()
+		if not ticket_id:
+			continue
+		ticket_meta[ticket_id] = {
+			"customer_priority": _get_value(row, ("customer_priority", "priority", "customer priority")),
+			"changed_date": _get_value(row, ("changed_date", "system.changeddate")),
+			"work_item_type": _get_value(row, ("work_item_type", "type", "system.workitemtype")),
+			"title": _get_value(row, ("title", "system.title")),
+			"state": _get_value(row, ("state", "system.state")),
+			"area_path": _get_value(row, ("area_path", "system.areapath")),
+		}
+
+	def _priority_points(priority: str) -> tuple[int, str, int]:
+		value = (priority or "").strip().lower()
+		if value == "on fire":
+			return 25, "PRIORITY_ON_FIRE", 3
+		if value == "urgent":
+			return 20, "PRIORITY_URGENT", 2
+		if value == "high":
+			return 15, "PRIORITY_HIGH", 1
+		return 0, "PRIORITY_OTHER", 0
+
+	def _recency_points(changed_date: str) -> tuple[int, str, int]:
+		age_days = _parse_changed_age_days(changed_date)
+		if age_days is None:
+			return 0, "NO_RECENCY_DATA", 9999
+		if age_days <= recent_window_days:
+			return 15, f"RECENT_0_{recent_window_days}D", age_days
+		if age_days <= recent_window_days * 2:
+			return 8, f"RECENT_{recent_window_days + 1}_{recent_window_days * 2}D", age_days
+		return 2, f"OLDER_{recent_window_days * 2}D_PLUS", age_days
+
+	ticket_candidates: dict[str, dict[str, object]] = {}
+	for modified_func in sorted(modified_functions):
+		contexts: list[tuple[str, str, int]] = [(modified_func, "direct_change", 0)]
+		for dependent in sorted(dependency_map.get(modified_func, set())):
+			contexts.append((dependent, "dependent_change", 1))
+
+		for candidate_func, relationship_type, dependency_distance in contexts:
+			for ticket_id in functionality_to_ids.get(candidate_func, []):
+				meta = ticket_meta.get(ticket_id, {})
+				priority_points, priority_code, priority_rank = _priority_points(str(meta.get("customer_priority", "")))
+				recency_points, recency_code, age_days = _recency_points(str(meta.get("changed_date", "")))
+				match_points = 50 if dependency_distance == 0 else 35
+				distance_penalty = dependency_distance * 7
+				raw_score = max(0, min(100, match_points + priority_points + recency_points - distance_penalty))
+				reason_codes = ["DIRECT_MATCH" if dependency_distance == 0 else f"DEP_{dependency_distance}_HOP", priority_code, recency_code]
+
+				row = {
+					"ticket_id": ticket_id,
+					"module_name": functionality_to_module.get(candidate_func, functionality_to_module.get(modified_func, "")),
+					"feature_name": "; ".join(sorted(functionality_to_features.get(candidate_func, set()))),
+					"modified_functionality": modified_func,
+					"dependent_functionality": candidate_func,
+					"relationship_type": relationship_type,
+					"dependency_distance": dependency_distance,
+					"impact_score_raw": raw_score,
+					"impact_reason": "; ".join(reason_codes),
+					"customer_priority": str(meta.get("customer_priority", "")),
+					"changed_date": str(meta.get("changed_date", "")),
+					"work_item_type": str(meta.get("work_item_type", "")),
+					"title": str(meta.get("title", "")),
+					"state": str(meta.get("state", "")),
+					"area_path": str(meta.get("area_path", "")),
+					"priority_rank": priority_rank,
+					"age_days": age_days,
+				}
+
+				existing = ticket_candidates.get(ticket_id)
+				if existing is None:
+					ticket_candidates[ticket_id] = row
+					continue
+
+				existing_score = int(existing.get("impact_score_raw", 0))
+				if raw_score > existing_score:
+					ticket_candidates[ticket_id] = row
+					continue
+				if raw_score == existing_score:
+					existing_distance = int(existing.get("dependency_distance", 99))
+					if dependency_distance < existing_distance:
+						ticket_candidates[ticket_id] = row
+
+	scored_rows = list(ticket_candidates.values())
+	scored_rows.sort(
+		key=lambda item: (
+			-int(item.get("impact_score_raw", 0)),
+			int(item.get("dependency_distance", 99)),
+			-int(item.get("priority_rank", 0)),
+			int(item.get("age_days", 9999)) if isinstance(item.get("age_days", 9999), int) else 9999,
+			str(item.get("ticket_id", "")),
+		)
+	)
+
+	last_raw: int | None = None
+	continuous_score = 100
+	for row in scored_rows:
+		raw = int(row.get("impact_score_raw", 0))
+		if last_raw is None:
+			continuous_score = 100
+		elif raw < last_raw:
+			continuous_score = max(1, continuous_score - 1)
+		row["impact_score"] = continuous_score
+		last_raw = raw
+		if continuous_score >= 85:
+			row["risk_level"] = "High"
+		elif continuous_score >= 70:
+			row["risk_level"] = "Medium"
+		elif continuous_score > 0:
+			row["risk_level"] = "Low"
+		else:
+			row["risk_level"] = "None"
+
+	detailed_rows = [
+		{
+			"ticket_id": str(row.get("ticket_id", "")),
+			"impact_score": str(row.get("impact_score", "")),
+			"impact_score_raw": str(row.get("impact_score_raw", "")),
+			"dependency_distance": str(row.get("dependency_distance", "")),
+			"impact_reason": str(row.get("impact_reason", "")),
+			"risk_level": str(row.get("risk_level", "")),
+			"relationship_type": str(row.get("relationship_type", "")),
+			"module_name": str(row.get("module_name", "")),
+			"feature_name": str(row.get("feature_name", "")),
+			"modified_functionality": str(row.get("modified_functionality", "")),
+			"dependent_functionality": str(row.get("dependent_functionality", "")),
+			"customer_priority": str(row.get("customer_priority", "")),
+			"changed_date": str(row.get("changed_date", "")),
+			"work_item_type": str(row.get("work_item_type", "")),
+			"state": str(row.get("state", "")),
+			"title": str(row.get("title", "")),
+			"area_path": str(row.get("area_path", "")),
+		}
+		for row in scored_rows
+	]
+
+	_write_dict_csv(
+		output_csv_path,
+		[
+			"ticket_id",
+			"impact_score",
+			"impact_score_raw",
+			"dependency_distance",
+			"impact_reason",
+			"risk_level",
+			"relationship_type",
+			"module_name",
+			"feature_name",
+			"modified_functionality",
+			"dependent_functionality",
+			"customer_priority",
+			"changed_date",
+			"work_item_type",
+			"state",
+			"title",
+			"area_path",
+		],
+		detailed_rows,
+	)
+
+	# Group by score AND function context to avoid mixing unrelated tickets under one label.
+	score_context_groups: dict[tuple[int, str, str, str], list[dict[str, object]]] = {}
+	for row in scored_rows:
+		score = int(row.get("impact_score", 0))
+		group_key = (
+			score,
+			str(row.get("modified_functionality", "")),
+			str(row.get("dependent_functionality", "")),
+			str(row.get("relationship_type", "")),
+		)
+		score_context_groups.setdefault(group_key, []).append(row)
+
+	ordered_groups = sorted(
+		score_context_groups.items(),
+		key=lambda item: (
+			-item[0][0],
+			-len(item[1]),
+			item[0][2].lower(),
+			item[0][1].lower(),
+		),
+	)
+
+	grouped_rows_all: list[dict[str, str]] = []
+	for (score, modified_func, dependent_func, relationship_type), group in ordered_groups:
+		ticket_ids = [str(item.get("ticket_id", "")) for item in group if str(item.get("ticket_id", ""))]
+		modules = sorted({str(item.get("module_name", "")) for item in group if str(item.get("module_name", ""))})
+		features = sorted({str(item.get("feature_name", "")) for item in group if str(item.get("feature_name", ""))})
+		reasons = sorted({str(item.get("impact_reason", "")) for item in group if str(item.get("impact_reason", ""))})
+		min_distance = min(int(item.get("dependency_distance", 99)) for item in group)
+		risk_rank = {"High": 3, "Medium": 2, "Low": 1, "None": 0}
+		risk_level = sorted(
+			(str(item.get("risk_level", "None")) for item in group),
+			key=lambda value: risk_rank.get(value, 0),
+			reverse=True,
+		)[0]
+		preview = ticket_ids[:5]
+		more = max(0, len(ticket_ids) - len(preview))
+		preview_text = "; ".join(preview)
+		grouped_rows_all.append(
+			{
+				"impact_score": str(score),
+				"ticket_count": str(len(ticket_ids)),
+				"ticket_ids_preview": preview_text,
+				"ticket_ids_all": "; ".join(ticket_ids),
+				"ticket_more_count": str(more),
+				"module_name": modules[0] if modules else "",
+				"feature_name": "; ".join(features[:2]),
+				"modified_functionality": modified_func,
+				"dependent_functionality": dependent_func,
+				"relationship_type": relationship_type,
+				"dependency_distance": str(min_distance),
+				"impact_reason": reasons[0] if reasons else "",
+				"risk_level": risk_level,
+			}
+		)
+
+	max_client_score_levels = 500
+	grouped_rows = grouped_rows_all[:top_score_levels]
+	grouped_rows_client = grouped_rows_all[:max_client_score_levels]
+
+	risk_counts = {
+		"high": sum(1 for row in scored_rows if str(row.get("risk_level")) == "High"),
+		"medium": sum(1 for row in scored_rows if str(row.get("risk_level")) == "Medium"),
+		"low": sum(1 for row in scored_rows if str(row.get("risk_level")) == "Low"),
+	}
+
+	functionality_cards = []
+	for func, count in sorted(functionality_to_count.items(), key=lambda item: item[1], reverse=True):
+		functionality_cards.append({
+			"functionality": func,
+			"module_name": functionality_to_module.get(func, ""),
+			"ticket_count": count,
+		})
+
+	return {
+		"cards": {
+			"total_modules": len(module_cards),
+			"total_functionalities": len(functionality_to_count),
+			"total_modified_functions": len(modified_functions),
+			"candidate_rows": len(scored_rows),
+			"high_risk_rows": risk_counts["high"],
+		},
+		"top_modules": module_cards,
+		"top_functionalities": functionality_cards,
+		"risk_counts": risk_counts,
+		"recurrence_candidates": grouped_rows,
+		"recurrence_candidates_all": grouped_rows_client,
+		"available_score_levels": len(grouped_rows_client),
+		"total_score_levels": len(grouped_rows_all),
+		"outputs": {
+			"recurrence_csv": str(output_csv_path),
+			"module_summary_csv": str(DEFAULT_MODULE_SUMMARY_CSV),
+			"functionality_summary_csv": str(DEFAULT_FUNCTIONALITY_SUMMARY_CSV),
+		},
+	}
+
+
+@app.post("/api/predictive/run-defaults")
+async def run_predictive_defaults(
+	release_name: str = Form("MSP Default Run"),
+	days: int = Form(180),
+	top_score_levels: int = Form(50),
+	work_item_scope: str = Form("Bug,Customer Ticket"),
+	priority_scope: str = Form("On Fire,Urgent,High"),
+	match_mode: str = Form("strict"),
+	include_dependencies: bool = Form(True),
+	modified_functions_csv: UploadFile | None = File(None),
+	dependency_metrics_csv: UploadFile | None = File(None),
+	feature_module_csv: UploadFile | None = File(None),
+	module_summary_csv: UploadFile | None = File(None),
+	functionality_summary_csv: UploadFile | None = File(None),
+) -> dict[str, object]:
+	module_rows = await _read_csv_rows_from_upload(module_summary_csv)
+	if not module_rows:
+		module_rows = _read_csv_rows_from_path(DEFAULT_MODULE_SUMMARY_CSV)
+
+	functionality_rows = await _read_csv_rows_from_upload(functionality_summary_csv)
+	if not functionality_rows:
+		functionality_rows = _read_csv_rows_from_path(DEFAULT_FUNCTIONALITY_SUMMARY_CSV)
+
+	feature_rows = await _read_csv_rows_from_upload(feature_module_csv)
+	if not feature_rows:
+		feature_rows = _read_csv_rows_from_path(DEFAULT_FEATURE_MODULE_CSV)
+
+	dependency_rows = await _read_csv_rows_from_upload(dependency_metrics_csv)
+	modified_rows = await _read_csv_rows_from_upload(modified_functions_csv)
+	ticket_rows = _read_csv_rows_from_path(DEFAULT_TICKET_EXPORT_CSV)
+
+	if not module_rows or not functionality_rows or not feature_rows:
+		raise HTTPException(
+			status_code=400,
+			detail=(
+				"Required baseline CSV data is missing. Provide uploads or ensure these files exist: "
+				"bug_ticket_feature_module_recurrence_summary.csv, "
+				"bug_ticket_functionality_summary.csv, "
+				"msp_feature_module_mapping.csv"
+			),
+		)
+
+	result = _compute_predictive_outputs(
+		module_summary_rows=module_rows,
+		functionality_summary_rows=functionality_rows,
+		feature_module_rows=feature_rows,
+		dependency_rows=dependency_rows if include_dependencies else [],
+		modified_function_rows=modified_rows,
+		ticket_rows=ticket_rows,
+		output_csv_path=DEFAULT_RECURRENCE_OUTPUT_CSV,
+		recent_window_days=DEFAULT_RECENT_WINDOW_DAYS,
+		top_score_levels=max(1, min(top_score_levels, 500)),
+	)
+
+	result["run_meta"] = {
+		"release_name": release_name,
+		"days": days,
+		"work_item_scope": work_item_scope,
+		"priority_scope": priority_scope,
+		"match_mode": match_mode,
+		"include_dependencies": include_dependencies,
+		"top_score_levels": max(1, min(top_score_levels, 500)),
+		"ran_at": datetime.now(timezone.utc).isoformat(),
+	}
+	return result
+
+
+@app.post("/api/predictive/run-e2e")
+async def run_predictive_end_to_end(
+	release_name: str = Form("MSP End-to-End Run"),
+	days: int = Form(180),
+	top_score_levels: int = Form(50),
+	work_item_scope: str = Form("Bug,Customer Ticket"),
+	priority_scope: str = Form("On Fire,Urgent,High"),
+	match_mode: str = Form("strict"),
+	include_dependencies: bool = Form(True),
+	refresh_ado_export: bool = Form(True),
+	apply_query_update: bool = Form(False),
+	msp_sheet_name: str = Form(DEFAULT_MSP_SHEET_NAME),
+	msp_target_category: str = Form(DEFAULT_MSP_TARGET_CATEGORY),
+	run_id: str = Form(""),
+	msp_workbook: UploadFile | None = File(None),
+	dependency_metrics_csv: UploadFile | None = File(None),
+	modified_functions_csv: UploadFile | None = File(None),
+) -> dict[str, object]:
+	run_id = run_id.strip() or str(uuid4())
+	_set_predictive_run_status(run_id, "running", "validation", "Validating inputs")
+
+	if msp_workbook is None:
+		_set_predictive_run_status(run_id, "failed", "validation", "MSP workbook is required")
+		raise HTTPException(status_code=400, detail="MSP workbook is required for end-to-end run.")
+
+	workbook_name = msp_workbook.filename or "uploaded_msp.xlsx"
+	workbook_suffix = Path(workbook_name).suffix or ".xlsx"
+	if workbook_suffix.lower() not in {".xlsx", ".xlsm", ".xls"}:
+		_set_predictive_run_status(run_id, "failed", "validation", "MSP workbook extension is invalid")
+		raise HTTPException(status_code=400, detail="MSP workbook must be .xlsx, .xlsm, or .xls")
+
+	workbook_bytes = await msp_workbook.read()
+	if not workbook_bytes:
+		_set_predictive_run_status(run_id, "failed", "validation", "Uploaded MSP workbook is empty")
+		raise HTTPException(status_code=400, detail="Uploaded MSP workbook is empty.")
+
+	stage_logs: dict[str, str] = {}
+	with NamedTemporaryFile(suffix=workbook_suffix, delete=False) as tmp_file:
+		tmp_file.write(workbook_bytes)
+		tmp_workbook_path = Path(tmp_file.name)
+
+	try:
+		_set_predictive_run_status(run_id, "running", "msp_feature_module_mapper", "Generating MSP feature-module mapping")
+		mapper_cmd = [
+			sys.executable,
+			str(ROOT_DIR / "msp_feature_module_mapper.py"),
+			"--workbook",
+			str(tmp_workbook_path),
+			"--sheet-name",
+			msp_sheet_name,
+			"--target-category",
+			msp_target_category,
+			"--output",
+			str(DEFAULT_FEATURE_MODULE_CSV),
+			"--module-summary-output",
+			str(ROOT_DIR / "msp_module_summary.csv"),
+			"--log-level",
+			"ERROR",
+		]
+		stage_logs["msp_feature_module_mapper"] = await asyncio.to_thread(_run_python_command, mapper_cmd, "MSP feature-module mapping")
+
+		if refresh_ado_export:
+			_set_predictive_run_status(run_id, "running", "ado_export", "Refreshing ADO export CSV")
+			ado_cmd = [
+				sys.executable,
+				str(ROOT_DIR / "create_poc_ado_query.py"),
+				"--export-csv",
+				str(DEFAULT_TICKET_EXPORT_CSV),
+			]
+			if apply_query_update:
+				ado_cmd.extend(["--apply", "--update-if-exists"])
+			stage_logs["ado_export"] = await asyncio.to_thread(_run_python_command, ado_cmd, "ADO ticket export")
+		else:
+			_set_predictive_run_status(run_id, "running", "ado_export", "Skipping ADO export refresh (using existing CSV)")
+
+		_set_predictive_run_status(run_id, "running", "combine_mapping", "Building combined mapping and summaries")
+		combine_cmd = [
+			sys.executable,
+			str(ROOT_DIR / "combine_bug_feature_module_mapping.py"),
+			"--bug-ticket-csv",
+			str(DEFAULT_TICKET_EXPORT_CSV),
+			"--feature-csv",
+			str(DEFAULT_FEATURE_MODULE_CSV),
+			"--output-csv",
+			str(ROOT_DIR / "bug_ticket_feature_module_mapping.csv"),
+			"--summary-csv",
+			str(DEFAULT_MODULE_SUMMARY_CSV),
+			"--functionality-summary-csv",
+			str(DEFAULT_FUNCTIONALITY_SUMMARY_CSV),
+		]
+		stage_logs["combine_mapping"] = await asyncio.to_thread(_run_python_command, combine_cmd, "Combined mapping generation")
+
+		_set_predictive_run_status(run_id, "running", "load_inputs", "Loading generated CSV inputs")
+		module_rows = _read_csv_rows_from_path(DEFAULT_MODULE_SUMMARY_CSV)
+		functionality_rows = _read_csv_rows_from_path(DEFAULT_FUNCTIONALITY_SUMMARY_CSV)
+		feature_rows = _read_csv_rows_from_path(DEFAULT_FEATURE_MODULE_CSV)
+		ticket_rows = _read_csv_rows_from_path(DEFAULT_TICKET_EXPORT_CSV)
+
+		if not module_rows or not functionality_rows or not feature_rows:
+			raise HTTPException(
+				status_code=500,
+				detail="End-to-end run did not generate expected intermediate CSV outputs.",
+			)
+
+		dependency_rows = await _read_csv_rows_from_upload(dependency_metrics_csv)
+		provided_modified_rows = await _read_csv_rows_from_upload(modified_functions_csv)
+		modified_rows = provided_modified_rows or _derive_modified_functions_from_feature_rows(feature_rows)
+
+		_set_predictive_run_status(run_id, "running", "predictive_scoring", "Computing recurrence scoring and top candidates")
+		result = _compute_predictive_outputs(
+			module_summary_rows=module_rows,
+			functionality_summary_rows=functionality_rows,
+			feature_module_rows=feature_rows,
+			dependency_rows=dependency_rows if include_dependencies else [],
+			modified_function_rows=modified_rows,
+			ticket_rows=ticket_rows,
+			output_csv_path=DEFAULT_RECURRENCE_OUTPUT_CSV,
+			recent_window_days=DEFAULT_RECENT_WINDOW_DAYS,
+			top_score_levels=max(1, min(top_score_levels, 500)),
+		)
+		_set_predictive_run_status(run_id, "running", "finalizing", "Preparing final results")
+	except HTTPException as exc:
+		_set_predictive_run_status(run_id, "failed", "failed", str(exc.detail)[:300])
+		raise
+	except Exception as exc:
+		_set_predictive_run_status(run_id, "failed", "failed", str(exc)[:300])
+		raise
+	finally:
+		try:
+			tmp_workbook_path.unlink(missing_ok=True)
+		except Exception:
+			pass
+
+	result["run_meta"] = {
+		"release_name": release_name,
+		"days": days,
+		"work_item_scope": work_item_scope,
+		"priority_scope": priority_scope,
+		"match_mode": match_mode,
+		"include_dependencies": include_dependencies,
+		"top_score_levels": max(1, min(top_score_levels, 500)),
+		"refresh_ado_export": refresh_ado_export,
+		"apply_query_update": apply_query_update,
+		"msp_sheet_name": msp_sheet_name,
+		"msp_target_category": msp_target_category,
+		"run_id": run_id,
+		"ran_at": datetime.now(timezone.utc).isoformat(),
+	}
+	result["stage_logs"] = {
+		name: (content[-800:] if content else "")
+		for name, content in stage_logs.items()
+	}
+	result["outputs"]["ticket_export_csv"] = str(DEFAULT_TICKET_EXPORT_CSV)
+	result["outputs"]["feature_module_csv"] = str(DEFAULT_FEATURE_MODULE_CSV)
+	_set_predictive_run_status(run_id, "completed", "completed", "Pipeline completed successfully")
+	return result
+
+
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
 	return _ui_html()
@@ -935,74 +1782,92 @@ async def api_status() -> dict[str, object]:
 
 @app.post("/api/context/upload")
 async def upload_context_files(
-    files: list[UploadFile] = File(...),
-    session_id: str | None = Form(None),
+	files: list[UploadFile] = File(...),
+	session_id: str | None = Form(None),
 ) -> dict[str, object]:
-    active_session_id = (session_id or "").strip() or str(uuid4())
-    existing_docs = CONTEXT_STORE.get(active_session_id, [])
+	active_session_id = (session_id or "").strip() or str(uuid4())
+	existing_docs = _fetch_context_docs(active_session_id)
 
-    if len(existing_docs) >= MAX_FILES_PER_SESSION:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Session already has max {MAX_FILES_PER_SESSION} files",
-        )
+	if len(existing_docs) >= MAX_FILES_PER_SESSION:
+		raise HTTPException(
+			status_code=400,
+			detail=f"Session already has max {MAX_FILES_PER_SESSION} files",
+		)
 
-    uploaded_documents: list[dict[str, object]] = []
+	uploaded_documents: list[dict[str, object]] = []
+	remaining_slots = max(0, MAX_FILES_PER_SESSION - len(existing_docs))
 
-    for upload in files:
-        # Enforce max files per session
-        if len(existing_docs) + len(uploaded_documents) >= MAX_FILES_PER_SESSION:
-            break
+	for upload in files[:remaining_slots]:
+		text, size_bytes = await _read_upload_text(upload)
+		# Store a bounded excerpt per file so large CSVs remain usable in chat context
+		# instead of being evicted immediately by the total-context cap.
+		text = _trim_context(text, max_chars=MAX_CONTEXT_CHARS_PER_FILE)
+		document_id = str(uuid4())
+		storage_path = UPLOAD_CONTEXT_DIR / f"{document_id}.txt"
+		storage_path.write_text(text, encoding="utf-8")
+		uploaded_at = datetime.now(timezone.utc).isoformat()
 
-        text, size_bytes = await _read_upload_text(upload)
-        document_id = str(uuid4())
-        record = {
-            "document_id": document_id,
-            "filename": upload.filename or "uploaded_file",
-            "text": text,
-            "size_bytes": size_bytes,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        }
-        uploaded_documents.append({
-            "document_id": document_id,
-            "filename": record["filename"],
-            "chars": len(text),
-            "size_bytes": size_bytes,
-        })
-        existing_docs.append(record)
+		with _context_db_connection() as conn:
+			conn.execute(
+				"""
+				INSERT INTO uploaded_context_documents
+				(document_id, session_id, filename, storage_path, size_bytes, char_count, uploaded_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?)
+				""",
+				(
+					document_id,
+					active_session_id,
+					upload.filename or "uploaded_file",
+					str(storage_path),
+					int(size_bytes),
+					len(text),
+					uploaded_at,
+				),
+			)
 
-    # Cap total context size in this session (oldest dropped first)
-    total_chars = sum(len(str(d.get("text", ""))) for d in existing_docs)
-    while total_chars > MAX_CONTEXT_CHARS and existing_docs:
-        removed = existing_docs.pop(0)
-        total_chars -= len(str(removed.get("text", "")))
+		uploaded_documents.append(
+			{
+				"document_id": document_id,
+				"filename": upload.filename or "uploaded_file",
+				"chars": len(text),
+				"size_bytes": size_bytes,
+			}
+		)
 
-    CONTEXT_STORE[active_session_id] = existing_docs
+	# Cap total context size in this session (oldest dropped first).
+	# This keeps recent files available while enforcing a hard session bound.
+	docs_after_upload = _fetch_context_docs(active_session_id)
+	total_chars = sum(int(row["char_count"]) for row in docs_after_upload)
+	while total_chars > MAX_CONTEXT_CHARS and docs_after_upload:
+		oldest = docs_after_upload.pop(0)
+		total_chars -= int(oldest["char_count"])
+		_delete_context_document(str(oldest["document_id"]))
 
-    return {
-        "session_id": active_session_id,
-        "uploaded_documents": uploaded_documents,
-        "total_documents_in_session": len(existing_docs),
-        "total_context_chars": total_chars,
-    }
+	retained_docs = _fetch_context_docs(active_session_id)
+	retained_ids = {str(row["document_id"]) for row in retained_docs}
+	retained_uploads = [doc for doc in uploaded_documents if str(doc["document_id"]) in retained_ids]
+
+	return {
+		"session_id": active_session_id,
+		"uploaded_documents": retained_uploads,
+		"total_documents_in_session": len(retained_docs),
+		"total_context_chars": sum(int(row["char_count"]) for row in retained_docs),
+	}
 
 
 @app.delete("/api/context/{session_id}/{document_id}")
 async def delete_context_file(session_id: str, document_id: str) -> dict[str, object]:
-	docs = CONTEXT_STORE.get(session_id)
+	docs = _fetch_context_docs(session_id)
 	if not docs:
 		raise HTTPException(status_code=404, detail="Session context not found")
 
-	remaining = [d for d in docs if str(d.get("document_id")) != document_id]
-	if len(remaining) == len(docs):
+	doc_ids = {str(row["document_id"]) for row in docs}
+	if document_id not in doc_ids:
 		raise HTTPException(status_code=404, detail="Document not found in session context")
 
-	if remaining:
-		CONTEXT_STORE[session_id] = remaining
-	else:
-		CONTEXT_STORE.pop(session_id, None)
-
-	total_chars = sum(len(str(d.get("text", ""))) for d in remaining)
+	_delete_context_document(document_id)
+	remaining = _fetch_context_docs(session_id)
+	total_chars = sum(int(row["char_count"]) for row in remaining)
 	return {
 		"session_id": session_id,
 		"document_id": document_id,
@@ -1014,10 +1879,12 @@ async def delete_context_file(session_id: str, document_id: str) -> dict[str, ob
 
 @app.delete("/api/context/{session_id}")
 async def clear_context_files(session_id: str) -> dict[str, object]:
-	if session_id not in CONTEXT_STORE:
+	docs = _fetch_context_docs(session_id)
+	if not docs:
 		raise HTTPException(status_code=404, detail="Session context not found")
 
-	CONTEXT_STORE.pop(session_id, None)
+	for row in docs:
+		_delete_context_document(str(row["document_id"]))
 	return {
 		"session_id": session_id,
 		"cleared": True,
@@ -1046,6 +1913,14 @@ async def readiness() -> dict[str, object]:
 		},
 		"features": status,
 	}
+
+
+@app.get("/api/predictive/run-status")
+async def predictive_run_status(run_id: str = Query(...)) -> dict[str, object]:
+	run = PREDICTIVE_RUN_STATUS.get(run_id)
+	if run is None:
+		raise HTTPException(status_code=404, detail=f"Run not found: {run_id}")
+	return run
 
 
 @app.get("/capabilities")
@@ -1434,6 +2309,60 @@ async def chat(payload: ChatRequest) -> dict[str, object]:
 	if payload.include_uploaded_context:
 		uploaded_context, uploaded_sources = _build_uploaded_context(payload.session_id)
 
+	# Respect explicit user instruction to stay file-grounded and avoid external systems.
+	file_only_tokens = (
+		"use attached csv files only",
+		"attached files only",
+		"do not query external systems",
+		"do not use external systems",
+		"use uploaded files only",
+	)
+	force_uploaded_context_only = any(token in lower for token in file_only_tokens)
+	explicit_ado_tokens = (
+		"azure devops",
+		" from ado",
+		"use ado",
+		"query ado",
+		"ado work item",
+		"work item id",
+	)
+	explicit_ado_request = any(token in lower for token in explicit_ado_tokens)
+
+	# If user explicitly asks to use attached files but no active upload context is bound,
+	# return a deterministic error instead of letting the model hallucinate missing files.
+	expects_attached_context = any(
+		token in lower
+		for token in (
+			"attached",
+			"attachment",
+			"uploaded",
+			"csv",
+			"file",
+			"source of truth",
+			"validate fields",
+		)
+	)
+	if payload.include_uploaded_context and expects_attached_context and not uploaded_context:
+		return {
+			"assistant_message": (
+				"No active uploaded context was found for this chat session. "
+				"Please attach files again in this same chat thread, then resend your prompt."
+			),
+			"source": "uploaded_context_missing",
+			"grounded": False,
+			"presidio_protected": False,
+			"sanitization_mode": "n/a",
+			"response_meta": {
+				"source": "uploaded_context_missing",
+				"grounded": False,
+				"presidio_check": "n/a",
+				"sanitization_mode": "n/a",
+				"uploaded_context_used": False,
+				"uploaded_sources": [],
+				"session_id": payload.session_id,
+			},
+		}
+
 	if _is_testcase_generation_intent(message):
 		requested_count = _extract_requested_count(message)
 		try:
@@ -1457,7 +2386,16 @@ async def chat(payload: ChatRequest) -> dict[str, object]:
 				},
 			}
 
-	if _is_ado_grounded_chat_intent(message):
+	should_route_to_ado = (
+		_is_ado_grounded_chat_intent(message)
+		and not force_uploaded_context_only
+		and (
+			extracted_work_item_id is not None
+			or explicit_ado_request
+			or not uploaded_context
+		)
+	)
+	if should_route_to_ado:
 		try:
 			return await _generate_chat_from_ado_context(
 				message=message,
@@ -1762,6 +2700,47 @@ def _ui_html() -> str:
 		.action-btn.alt{background:linear-gradient(130deg,#ff9a4d,#ff7272);}
 		.action-btn:disabled{opacity:0.55;cursor:default;}
 
+		.struct-shell{display:grid;gap:14px;}
+		.struct-grid{display:grid;grid-template-columns:repeat(4,minmax(170px,1fr));gap:12px;}
+		.struct-field{display:flex;flex-direction:column;gap:6px;}
+		.struct-field label{font-size:12px;font-weight:700;color:#4d5f79;text-transform:uppercase;letter-spacing:0.4px;}
+		.struct-field input,.struct-field select{
+			border:1px solid var(--line);
+			border-radius:10px;
+			padding:10px 12px;
+			font-size:14px;
+			background:#fff;
+			color:#2f3a4f;
+		}
+		.struct-field input:focus,.struct-field select:focus{outline:none;border-color:#9eb8ea;box-shadow:0 0 0 3px rgba(31,111,235,0.10);}
+		.struct-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
+		.struct-run{border:none;border-radius:10px;padding:11px 18px;font-weight:700;font-size:14px;color:#fff;background:linear-gradient(120deg,#0ca06f,#0d7f5a);cursor:pointer;}
+		.struct-run.alt{background:linear-gradient(120deg,#6c1f99,#5a1884);}
+		.struct-hint{font-size:12px;color:#677a95;}
+		.kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:12px;}
+		.kpi-card{border-radius:12px;padding:12px 14px;color:#fff;box-shadow:0 8px 18px rgba(20,34,58,0.15);}
+		.kpi-card h4{margin:0;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;opacity:0.9;}
+		.kpi-card .val{margin-top:6px;font-size:26px;font-weight:800;line-height:1;}
+		.kpi-a{background:linear-gradient(120deg,#2b6df5,#1949ba);}
+		.kpi-b{background:linear-gradient(120deg,#00a88f,#0a7f6d);}
+		.kpi-c{background:linear-gradient(120deg,#ff8c42,#f05c42);}
+		.kpi-d{background:linear-gradient(120deg,#8a5bd4,#6630ad);}
+		.kpi-e{background:linear-gradient(120deg,#f857a6,#c83a8a);}
+		.report-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+		.report-box{border:1px solid var(--line);border-radius:12px;background:#fff;padding:12px;}
+		.report-title{margin:0 0 8px;font-size:13px;font-weight:700;color:#4a5f7e;text-transform:uppercase;letter-spacing:0.4px;}
+		.bar-row{display:grid;grid-template-columns:1fr 60px;gap:8px;align-items:center;margin:7px 0;}
+		.bar-track{height:12px;background:#edf2fb;border-radius:999px;overflow:hidden;}
+		.bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#2b6df5,#7a46c5);}
+		.pill{display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid #d8c8ef;background:#f7efff;color:#5e2d87;}
+		.table-wrap{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fff;}
+		.table{width:100%;border-collapse:collapse;font-size:12px;}
+		.table th,.table td{border-bottom:1px solid #edf1f9;padding:8px 9px;vertical-align:top;text-align:left;}
+		.table th{position:sticky;top:0;background:#f7f9ff;color:#4b5f7f;z-index:1;}
+		.row-risk-high{background:#fff1f2;}
+		.row-risk-medium{background:#fff8ef;}
+		.row-risk-low{background:#f4fff8;}
+
 		.result-box{
 			border:1px solid var(--line);
 			border-radius:12px;
@@ -2064,6 +3043,9 @@ def _ui_html() -> str:
 			.action-btn{font-size:24px;}
 			.result-title{font-size:28px;}
 			.result-content{font-size:20px;}
+			.struct-grid{grid-template-columns:1fr 1fr;}
+			.kpi-grid{grid-template-columns:1fr 1fr;}
+			.report-grid{grid-template-columns:1fr;}
 		}
 	</style>
 </head>
@@ -2076,7 +3058,7 @@ def _ui_html() -> str:
 			<article class="card">
 				<div class="card-head">
 					<div class="brand-lockup"></div>
-					<button class="ghost-btn" onclick="showView('keyword')">Open Workspace</button>
+					<div></div>
 				</div>
 
 				<div class="home-body">
@@ -2085,8 +3067,8 @@ def _ui_html() -> str:
 
 					<div class="mode-switch">
 						<button class="mode-btn active" id="goFreeTextHome" onclick="showView('freetext')">Free Text View</button>
-						<!--<button class="mode-btn" id="goKeywordHome" onclick="showView('keyword')">Keyword View</button> -->
-						<button class="mode-btn" id="goKeywordHome" onclick="return false;" disabled>Keyword View</button>
+						<button class="mode-btn" id="goKeywordHome" disabled style="opacity:0.55;cursor:not-allowed;" title="Temporarily disabled">Keyword View</button>
+						<button class="mode-btn" id="goStructuredHome" onclick="showView('structured')">DefectPredictiveAnalysis</button>
 					</div>
 
 					<div class="hero-art">
@@ -2096,7 +3078,78 @@ def _ui_html() -> str:
 			</article>
 		</section>
 
-		<section id="keywordView" class="screen" style="display: none;">
+		<section id="structuredView" class="screen">
+			<article class="card frame">
+				<div class="bar">
+					<div style="display:flex;align-items:center;gap:10px;">
+						<button class="left-link" onclick="showView('home')">&#8249;</button>
+						<span class="muted" style="font-weight:700;">Home</span>
+					</div>
+					<div class="bar-title"><span class="brand-icon" style="width:30px;height:30px;border-radius:8px;font-size:13px;">AI</span>Predictive QA Flow</div>
+					<button class="ghost-btn" disabled style="opacity:0.55;cursor:not-allowed;" title="Temporarily disabled">Keyword View &#8250;</button>
+				</div>
+
+				<div class="panel-grid struct-shell">
+					<div class="struct-grid">
+						<div class="struct-field"><label>Release Name</label><input id="pfRelease" value="MSP Default Run"/></div>
+						<div class="struct-field"><label>Days Window</label><input id="pfDays" type="number" min="1" value="180"/></div>
+						<div class="struct-field"><label>Work Item Scope</label><input id="pfScope" value="Bug,Customer Ticket"/></div>
+						<div class="struct-field"><label>Priority Scope</label><input id="pfPriority" value="On Fire,Urgent,High"/></div>
+						<div class="struct-field"><label>Match Mode</label><select id="pfMatch"><option value="strict" selected>Strict</option><option value="fuzzy">Fuzzy</option></select></div>
+						<div class="struct-field"><label>Include Dependencies</label><select id="pfDeps"><option value="true" selected>Yes</option><option value="false">No</option></select></div>
+						<div class="struct-field"><label>MSP Workbook (.xlsx)</label><input id="pfMspFile" type="file" accept=".xlsx,.xlsm,.xls"/></div>
+						<div class="struct-field"><label>MSP Sheet Name</label><input id="pfMspSheet" value="6.0_1-AprilMSP_2026"/></div>
+						<div class="struct-field"><label>MSP Target Category</label><input id="pfMspCategory" value="Engineering Improvement Initiatives- NBL(I)"/></div>
+						<div class="struct-field"><label>Refresh ADO Export</label><select id="pfRefreshAdo"><option value="true" selected>Yes</option><option value="false">No (use existing CSV)</option></select></div>
+						<div class="struct-field"><label>Apply Query Update</label><select id="pfApplyQuery"><option value="false" selected>No</option><option value="true">Yes</option></select></div>
+						<div class="struct-field"><label>Modified Functions CSV</label><input id="pfModifiedFile" type="file" accept=".csv"/></div>
+						<div class="struct-field"><label>Dependency Metrics CSV</label><input id="pfDependencyFile" type="file" accept=".csv"/></div>
+					</div>
+
+					<div class="struct-actions">
+						<button id="pfRunE2EBtn" class="struct-run" onclick="runPredictiveE2E()">Run End-to-End (MSP -> Final)</button>
+						<button id="pfRunBtn" class="struct-run alt" onclick="runPredictiveDefaults()">Run Quick (Existing CSVs)</button>
+						<button class="struct-run alt" onclick="showView('freetext')">Open Chat Assistant</button>
+						<span id="pfStatus" class="struct-hint">Ready. Uses default CSVs if files are not uploaded.</span>
+					</div>
+
+					<div id="pfKpis" class="kpi-grid">
+						<div class="kpi-card kpi-a"><h4>Total Modules</h4><div class="val" id="kpiModules">-</div></div>
+						<div class="kpi-card kpi-b"><h4>Functionalities</h4><div class="val" id="kpiFuncs">-</div></div>
+						<div class="kpi-card kpi-c"><h4>Modified Funcs</h4><div class="val" id="kpiModified">-</div></div>
+						<div class="kpi-card kpi-d"><h4>Candidate Rows</h4><div class="val" id="kpiCandidates">-</div></div>
+						<div class="kpi-card kpi-e"><h4>High Risk</h4><div class="val" id="kpiHighRisk">-</div></div>
+					</div>
+
+					<div class="report-grid">
+						<div class="report-box">
+							<p class="report-title">Modules by Tickets (Full List)</p>
+							<div id="pfTopModules"></div>
+						</div>
+						<div class="report-box">
+							<p class="report-title">Functionalities by Tickets (Full List)</p>
+							<div id="pfTopFuncs"></div>
+						</div>
+					</div>
+
+					<div class="report-box">
+						<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+							<p class="report-title" id="pfTopScoresTitle">Probable Recurrence Candidates</p>
+							<div style="display:flex;align-items:center;gap:6px;">
+								<label for="pfTopLevels" class="muted" style="font-size:12px;font-weight:700;">Score Levels</label>
+								<input id="pfTopLevels" type="text" list="pfTopLevelsList" value="50" style="width:86px;"/>
+								<datalist id="pfTopLevelsList"><option value="10"></option><option value="25"></option><option value="50"></option><option value="75"></option><option value="100"></option><option value="150"></option><option value="200"></option></datalist>
+							</div>
+						</div>
+						<div class="table-wrap"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="9" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
+					</div>
+
+					<div class="struct-hint" id="pfOutputHint"></div>
+				</div>
+			</article>
+		</section>
+
+		<section id="keywordView" class="screen">
 			<article class="card frame">
 				<div class="bar">
 					<div style="display:flex;align-items:center;gap:10px;">
@@ -2184,10 +3237,354 @@ def _ui_html() -> str:
 	<script>
 		function showView(view) {
 			document.getElementById('homeView').classList.toggle('active', view === 'home');
-			// document.getElementById('keywordView').classList.toggle('active', view === 'keyword');
+			document.getElementById('keywordView').classList.toggle('active', view === 'keyword');
+			document.getElementById('structuredView').classList.toggle('active', view === 'structured');
 			document.getElementById('freetextView').classList.toggle('active', view === 'freetext');
 			document.getElementById('goFreeTextHome').classList.toggle('active', view === 'freetext');
-			document.getElementById('goKeywordHome').classList.toggle('active', view !== 'freetext');
+			document.getElementById('goKeywordHome').classList.toggle('active', view === 'keyword');
+			document.getElementById('goStructuredHome').classList.toggle('active', view === 'structured');
+		}
+
+		var predictiveCandidatesAll = [];
+		var predictiveLastRunMeta = null;
+		var predictiveLastRunType = '';
+
+		function getTopScoreLevelsValue() {
+			var raw = String((document.getElementById('pfTopLevels') || {}).value || '50').trim();
+			var parsed = Number(raw);
+			if (!Number.isFinite(parsed)) {
+				parsed = 50;
+			}
+			parsed = Math.max(1, Math.min(500, Math.floor(parsed)));
+			return parsed;
+		}
+
+		function setPredictiveBusyCursor(isBusy) {
+			document.body.style.cursor = isBusy ? 'progress' : '';
+		}
+
+		function stageLabel(step) {
+			var key = String(step || '').toLowerCase();
+			var labels = {
+				'validation': 'Validating Inputs',
+				'msp_feature_module_mapper': 'MSP Mapping',
+				'ado_export': 'ADO Export',
+				'combine_mapping': 'Combine Mapping',
+				'load_inputs': 'Load Inputs',
+				'predictive_scoring': 'Predictive Scoring',
+				'finalizing': 'Finalizing',
+				'completed': 'Completed',
+				'failed': 'Failed'
+			};
+			return labels[key] || (step || 'Running');
+		}
+
+		function formatRunProgressText(run) {
+			if (!run || typeof run !== 'object') {
+				return 'Running pipeline...';
+			}
+			var state = String(run.state || 'running').toLowerCase();
+			var step = stageLabel(run.step);
+			var msg = String(run.message || '').trim();
+			if (state === 'failed') {
+				return 'Failed at ' + step + (msg ? ': ' + msg : '');
+			}
+			if (state === 'completed') {
+				return 'Completed: ' + (msg || 'Pipeline completed successfully');
+			}
+			return '[Running] ' + step + (msg ? ' - ' + msg : '');
+		}
+
+		function startRunStatusPolling(runId, statusEl) {
+			if (!runId || !statusEl) {
+				return null;
+			}
+			var timer = setInterval(async function() {
+				try {
+					var res = await fetch('/api/predictive/run-status?run_id=' + encodeURIComponent(runId));
+					if (!res.ok) {
+						return;
+					}
+					var run = await res.json();
+					statusEl.textContent = formatRunProgressText(run);
+				} catch (_) {
+					// Ignore transient polling errors while the main request is still running.
+				}
+			}, 1200);
+			return timer;
+		}
+
+		function renderModuleBars(rows) {
+			if (!Array.isArray(rows) || !rows.length) {
+				return '<div class="muted">No module data.</div>';
+			}
+			var maxVal = rows.reduce(function(max, item){ return Math.max(max, Number(item.ticket_count || 0)); }, 1);
+			return rows.map(function(item){
+				var pct = Math.round((Number(item.ticket_count || 0) / maxVal) * 100);
+				return '<div class="bar-row"><div><div style="font-size:12px;font-weight:700;color:#334763;">' + (item.module_name || '-') + '</div><div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div></div><div style="text-align:right;font-weight:700;color:#334763;">' + String(item.ticket_count || 0) + '</div></div>';
+			}).join('');
+		}
+
+		function renderFuncBars(rows) {
+			if (!Array.isArray(rows) || !rows.length) {
+				return '<div class="muted">No functionality data.</div>';
+			}
+			var maxVal = rows.reduce(function(max, item){ return Math.max(max, Number(item.ticket_count || 0)); }, 1);
+			return rows.map(function(item){
+				var pct = Math.round((Number(item.ticket_count || 0) / maxVal) * 100);
+				return '<div class="bar-row"><div><div style="font-size:12px;font-weight:700;color:#334763;">' + (item.functionality || '-') + '</div><div style="font-size:11px;color:#6d809c;">' + (item.module_name || '') + '</div><div class="bar-track"><div class="bar-fill" style="width:' + pct + '%;background:linear-gradient(90deg,#ff8c42,#ef4e6c);"></div></div></div><div style="text-align:right;font-weight:700;color:#334763;">' + String(item.ticket_count || 0) + '</div></div>';
+			}).join('');
+		}
+
+		function shouldShowDependencyColumns(rows) {
+			if (!Array.isArray(rows) || !rows.length) {
+				return true;
+			}
+			return rows.some(function(item) {
+				var relationship = String(item.relationship_type || '').toLowerCase();
+				var distance = Number(item.dependency_distance || 0);
+				return relationship !== 'direct_change' || distance !== 0;
+			});
+		}
+
+		function setCandidateDependencyColumnsVisible(isVisible) {
+			var relationHead = document.getElementById('pfCandidateRelationshipHead');
+			var hopHead = document.getElementById('pfCandidateHopHead');
+			if (relationHead) {
+				relationHead.style.display = isVisible ? '' : 'none';
+			}
+			if (hopHead) {
+				hopHead.style.display = isVisible ? '' : 'none';
+			}
+		}
+
+		function renderCandidateRows(rows) {
+			var showDependencyColumns = shouldShowDependencyColumns(rows);
+			setCandidateDependencyColumnsVisible(showDependencyColumns);
+			if (!Array.isArray(rows) || !rows.length) {
+				return '<tr><td colspan="' + String(showDependencyColumns ? 9 : 7) + '" class="muted">No recurrence candidates found.</td></tr>';
+			}
+			return rows.map(function(item, idx){
+				var risk = String(item.risk_level || 'None');
+				var cls = risk === 'High' ? 'row-risk-high' : (risk === 'Medium' ? 'row-risk-medium' : (risk === 'Low' ? 'row-risk-low' : ''));
+				var preview = String(item.ticket_ids_preview || '-');
+				var allIds = String(item.ticket_ids_all || preview);
+				var moreCount = Number(item.ticket_more_count || 0);
+				var ticketCell = preview;
+				if (moreCount > 0) {
+					var expandedId = 'tickets-expanded-' + idx;
+					var toggleId = 'tickets-toggle-' + idx;
+					ticketCell += ' <a href="#" id="' + toggleId + '" onclick="return toggleTicketIds(\'' + expandedId + '\', this)">+' + String(moreCount) + ' more</a>';
+					ticketCell += '<div id="' + expandedId + '" style="display:none;margin-top:4px;font-size:11px;color:#51607a;">' + allIds + '</div>';
+				}
+				var relationCell = showDependencyColumns ? '<td><span class="pill">' + (item.relationship_type || '-') + '</span></td><td>' + String(item.dependency_distance || '-') + '</td>' : '';
+				return '<tr class="' + cls + '"><td>' + String(item.impact_score || '-') + '</td><td>' + String(item.ticket_count || 0) + '</td><td>' + ticketCell + '</td>' + relationCell + '<td>' + (item.module_name || '-') + '</td><td>' + (item.modified_functionality || '-') + '</td><td>' + (item.impact_reason || '-') + '</td><td>' + risk + '</td></tr>';
+			}).join('');
+		}
+
+		function updatePredictiveStatusFromCurrentView() {
+			var statusEl = document.getElementById('pfStatus');
+			if (!statusEl || !predictiveLastRunMeta) {
+				return;
+			}
+			var selectedLevels = getTopScoreLevelsValue();
+			var shownRows = Math.min(selectedLevels, predictiveCandidatesAll.length || 0);
+			if (predictiveLastRunType === 'e2e') {
+				statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | release: ' + (predictiveLastRunMeta.release_name || 'MSP End-to-End Run') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(predictiveCandidatesAll.length || 0) + ' | Returned Rows: ' + String(shownRows);
+				return;
+			}
+			statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | Match mode: ' + (predictiveLastRunMeta.match_mode || 'strict') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(predictiveCandidatesAll.length || 0) + ' | Returned Rows: ' + String(shownRows);
+		}
+
+		function applyPredictiveTopLevels() {
+			if (!Array.isArray(predictiveCandidatesAll) || !predictiveCandidatesAll.length) {
+				return;
+			}
+			var selectedLevels = getTopScoreLevelsValue();
+			var rowsToRender = predictiveCandidatesAll.slice(0, selectedLevels);
+			document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows(rowsToRender);
+			updatePredictiveStatusFromCurrentView();
+		}
+
+		function toggleTicketIds(containerId, linkEl) {
+			var el = document.getElementById(containerId);
+			if (!el) {
+				return false;
+			}
+			var isHidden = (el.style.display === 'none' || !el.style.display);
+			if (isHidden) {
+				el.style.display = 'block';
+				if (linkEl) { linkEl.textContent = 'show less'; }
+			} else {
+				el.style.display = 'none';
+				if (linkEl) {
+					var text = linkEl.textContent || '';
+					if (text.toLowerCase() === 'show less') {
+						var hiddenCount = (el.textContent || '').split(';').length;
+						var previewCount = 5;
+						var more = Math.max(0, hiddenCount - previewCount);
+						linkEl.textContent = '+' + String(more) + ' more';
+					}
+				}
+			}
+			return false;
+		}
+
+		async function runPredictiveDefaults() {
+			var statusEl = document.getElementById('pfStatus');
+			var runBtn = document.getElementById('pfRunBtn');
+			var runE2EBtn = document.getElementById('pfRunE2EBtn');
+			statusEl.textContent = 'Running default predictive flow...';
+			runBtn.disabled = true;
+			if (runE2EBtn) { runE2EBtn.disabled = true; }
+
+			try {
+				var formData = new FormData();
+				var topLevels = getTopScoreLevelsValue();
+				formData.append('release_name', document.getElementById('pfRelease').value || 'MSP Default Run');
+				formData.append('days', document.getElementById('pfDays').value || '180');
+				formData.append('top_score_levels', String(topLevels));
+				formData.append('work_item_scope', document.getElementById('pfScope').value || 'Bug,Customer Ticket');
+				formData.append('priority_scope', document.getElementById('pfPriority').value || 'On Fire,Urgent,High');
+				formData.append('match_mode', document.getElementById('pfMatch').value || 'strict');
+				formData.append('include_dependencies', String(document.getElementById('pfDeps').value === 'true'));
+
+				var modifiedFile = document.getElementById('pfModifiedFile').files[0];
+				if (modifiedFile) {
+					formData.append('modified_functions_csv', modifiedFile);
+				}
+				var dependencyFile = document.getElementById('pfDependencyFile').files[0];
+				if (dependencyFile) {
+					formData.append('dependency_metrics_csv', dependencyFile);
+				}
+
+				var res = await fetch('/api/predictive/run-defaults', {
+					method: 'POST',
+					body: formData,
+				});
+				var data = await res.json();
+				if (!res.ok) {
+					throw new Error(data.detail || 'Predictive flow failed');
+				}
+
+				var cards = data.cards || {};
+				document.getElementById('kpiModules').textContent = String(cards.total_modules || 0);
+				document.getElementById('kpiFuncs').textContent = String(cards.total_functionalities || 0);
+				document.getElementById('kpiModified').textContent = String(cards.total_modified_functions || 0);
+				document.getElementById('kpiCandidates').textContent = String(cards.candidate_rows || 0);
+				document.getElementById('kpiHighRisk').textContent = String(cards.high_risk_rows || 0);
+
+				document.getElementById('pfTopModules').innerHTML = renderModuleBars(data.top_modules || []);
+				document.getElementById('pfTopFuncs').innerHTML = renderFuncBars(data.top_functionalities || []);
+
+				var runMeta = data.run_meta || {};
+				document.getElementById('pfTopLevels').value = String(Number(runMeta.top_score_levels || topLevels));
+				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
+				predictiveLastRunMeta = runMeta;
+				predictiveLastRunType = 'default';
+				applyPredictiveTopLevels();
+				var outputs = data.outputs || {};
+				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [outputs.recurrence_csv, outputs.module_summary_csv, outputs.functionality_summary_csv].filter(Boolean).join(' | ');
+			} catch (err) {
+				statusEl.textContent = 'Error: ' + String(err);
+			} finally {
+				runBtn.disabled = false;
+				if (runE2EBtn) { runE2EBtn.disabled = false; }
+			}
+		}
+
+		async function runPredictiveE2E() {
+			var statusEl = document.getElementById('pfStatus');
+			var runBtn = document.getElementById('pfRunBtn');
+			var runE2EBtn = document.getElementById('pfRunE2EBtn');
+			var mspInput = document.getElementById('pfMspFile');
+			var mspFile = mspInput.files[0];
+			if (!mspFile) {
+				statusEl.textContent = 'Please select MSP workbook (.xlsx/.xlsm/.xls). Opening file picker...';
+				if (mspInput) {
+					mspInput.click();
+				}
+				return;
+			}
+
+			statusEl.textContent = '[Running] Initializing end-to-end pipeline...';
+			runBtn.disabled = true;
+			runE2EBtn.disabled = true;
+			setPredictiveBusyCursor(true);
+			var runId = 'e2e-' + String(Date.now()) + '-' + String(Math.floor(Math.random() * 100000));
+			var statusPollTimer = null;
+
+			try {
+				var formData = new FormData();
+				var topLevels = getTopScoreLevelsValue();
+				formData.append('release_name', document.getElementById('pfRelease').value || 'MSP End-to-End Run');
+				formData.append('days', document.getElementById('pfDays').value || '180');
+				formData.append('top_score_levels', String(topLevels));
+				formData.append('work_item_scope', document.getElementById('pfScope').value || 'Bug,Customer Ticket');
+				formData.append('priority_scope', document.getElementById('pfPriority').value || 'On Fire,Urgent,High');
+				formData.append('match_mode', document.getElementById('pfMatch').value || 'strict');
+				formData.append('include_dependencies', String(document.getElementById('pfDeps').value === 'true'));
+				formData.append('refresh_ado_export', String(document.getElementById('pfRefreshAdo').value === 'true'));
+				formData.append('apply_query_update', String(document.getElementById('pfApplyQuery').value === 'true'));
+				formData.append('msp_sheet_name', document.getElementById('pfMspSheet').value || '6.0_1-AprilMSP_2026');
+				formData.append('msp_target_category', document.getElementById('pfMspCategory').value || 'Engineering Improvement Initiatives- NBL(I)');
+				formData.append('run_id', runId);
+				formData.append('msp_workbook', mspFile);
+
+				var modifiedFile = document.getElementById('pfModifiedFile').files[0];
+				if (modifiedFile) {
+					formData.append('modified_functions_csv', modifiedFile);
+				}
+				var dependencyFile = document.getElementById('pfDependencyFile').files[0];
+				if (dependencyFile) {
+					formData.append('dependency_metrics_csv', dependencyFile);
+				}
+
+				statusPollTimer = startRunStatusPolling(runId, statusEl);
+
+				var res = await fetch('/api/predictive/run-e2e', {
+					method: 'POST',
+					body: formData,
+				});
+				var data = await res.json();
+				if (!res.ok) {
+					throw new Error(data.detail || 'End-to-end predictive flow failed');
+				}
+
+				var cards = data.cards || {};
+				document.getElementById('kpiModules').textContent = String(cards.total_modules || 0);
+				document.getElementById('kpiFuncs').textContent = String(cards.total_functionalities || 0);
+				document.getElementById('kpiModified').textContent = String(cards.total_modified_functions || 0);
+				document.getElementById('kpiCandidates').textContent = String(cards.candidate_rows || 0);
+				document.getElementById('kpiHighRisk').textContent = String(cards.high_risk_rows || 0);
+
+				document.getElementById('pfTopModules').innerHTML = renderModuleBars(data.top_modules || []);
+				document.getElementById('pfTopFuncs').innerHTML = renderFuncBars(data.top_functionalities || []);
+
+				var runMeta = data.run_meta || {};
+				document.getElementById('pfTopLevels').value = String(Number(runMeta.top_score_levels || topLevels));
+				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
+				predictiveLastRunMeta = runMeta;
+				predictiveLastRunType = 'e2e';
+				applyPredictiveTopLevels();
+				var outputs = data.outputs || {};
+				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [
+					outputs.ticket_export_csv,
+					outputs.feature_module_csv,
+					outputs.module_summary_csv,
+					outputs.functionality_summary_csv,
+					outputs.recurrence_csv
+				].filter(Boolean).join(' | ');
+			} catch (err) {
+				statusEl.textContent = 'Error: ' + String(err);
+			} finally {
+				if (statusPollTimer) {
+					clearInterval(statusPollTimer);
+				}
+				setPredictiveBusyCursor(false);
+				runBtn.disabled = false;
+				runE2EBtn.disabled = false;
+			}
 		}
 		/*
 		function parseTicketIds() {
@@ -3028,6 +4425,10 @@ def _ui_html() -> str:
 				event.preventDefault();
 				sendChat();
 			}
+		});
+
+		document.getElementById('pfTopLevels').addEventListener('input', function() {
+			applyPredictiveTopLevels();
 		});
 
 		showView('home');
