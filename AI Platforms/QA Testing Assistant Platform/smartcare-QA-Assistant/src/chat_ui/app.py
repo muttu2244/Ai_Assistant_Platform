@@ -3135,10 +3135,14 @@ def _ui_html() -> str:
 					<div class="report-box">
 						<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
 							<p class="report-title" id="pfTopScoresTitle">Probable Recurrence Candidates</p>
-							<div style="display:flex;align-items:center;gap:6px;">
+							<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
 								<label for="pfTopLevels" class="muted" style="font-size:12px;font-weight:700;">Score Levels</label>
 								<input id="pfTopLevels" type="text" list="pfTopLevelsList" value="50" style="width:86px;"/>
 								<datalist id="pfTopLevelsList"><option value="10"></option><option value="25"></option><option value="50"></option><option value="75"></option><option value="100"></option><option value="150"></option><option value="200"></option></datalist>
+								<label for="pfModuleFilter" class="muted" style="font-size:12px;font-weight:700;margin-left:8px;">Module</label>
+								<select id="pfModuleFilter" style="min-width:170px;"><option value="">All Modules</option></select>
+								<label for="pfFunctionFilter" class="muted" style="font-size:12px;font-weight:700;margin-left:8px;">Function</label>
+								<select id="pfFunctionFilter" style="min-width:220px;"><option value="">All Functions</option></select>
 							</div>
 						</div>
 						<div class="table-wrap"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="9" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
@@ -3382,26 +3386,120 @@ def _ui_html() -> str:
 			}).join('');
 		}
 
+		function getPredictiveFilterValues() {
+			var moduleFilter = String((document.getElementById('pfModuleFilter') || {}).value || '').trim().toLowerCase();
+			var functionFilter = String((document.getElementById('pfFunctionFilter') || {}).value || '').trim().toLowerCase();
+			return {
+				moduleFilter: moduleFilter,
+				functionFilter: functionFilter,
+			};
+		}
+
+		function getFilteredPredictiveCandidates() {
+			if (!Array.isArray(predictiveCandidatesAll) || !predictiveCandidatesAll.length) {
+				return [];
+			}
+			var filters = getPredictiveFilterValues();
+			return predictiveCandidatesAll.filter(function(item) {
+				var moduleName = String(item.module_name || '').trim().toLowerCase();
+				var modifiedFunction = String(item.modified_functionality || '').trim().toLowerCase();
+				if (filters.moduleFilter && moduleName !== filters.moduleFilter) {
+					return false;
+				}
+				if (filters.functionFilter && modifiedFunction !== filters.functionFilter) {
+					return false;
+				}
+				return true;
+			});
+		}
+
+		function repopulatePredictiveFilterDropdowns() {
+			var moduleEl = document.getElementById('pfModuleFilter');
+			var functionEl = document.getElementById('pfFunctionFilter');
+			if (!moduleEl || !functionEl) {
+				return;
+			}
+
+			var prevModule = String(moduleEl.value || '');
+			var prevFunction = String(functionEl.value || '');
+
+			var moduleNames = Array.from(new Set(
+				predictiveCandidatesAll
+					.map(function(item) { return String(item.module_name || '').trim(); })
+					.filter(function(value) { return !!value; })
+			)).sort(function(a, b) { return a.localeCompare(b); });
+
+			moduleEl.innerHTML = '<option value="">All Modules</option>' + moduleNames.map(function(name) {
+				return '<option value="' + name.replace(/"/g, '&quot;') + '">' + name + '</option>';
+			}).join('');
+
+			if (prevModule && moduleNames.indexOf(prevModule) !== -1) {
+				moduleEl.value = prevModule;
+			} else {
+				moduleEl.value = '';
+			}
+
+			repopulatePredictiveFunctionDropdown(prevFunction);
+		}
+
+		function repopulatePredictiveFunctionDropdown(previousValue) {
+			var moduleEl = document.getElementById('pfModuleFilter');
+			var functionEl = document.getElementById('pfFunctionFilter');
+			if (!moduleEl || !functionEl) {
+				return;
+			}
+
+			var selectedModule = String(moduleEl.value || '').trim().toLowerCase();
+			var functionNames = Array.from(new Set(
+				predictiveCandidatesAll
+					.filter(function(item) {
+						if (!selectedModule) {
+							return true;
+						}
+						var moduleName = String(item.module_name || '').trim().toLowerCase();
+						return moduleName === selectedModule;
+					})
+					.map(function(item) { return String(item.modified_functionality || '').trim(); })
+					.filter(function(value) { return !!value; })
+			)).sort(function(a, b) { return a.localeCompare(b); });
+
+			functionEl.innerHTML = '<option value="">All Functions</option>' + functionNames.map(function(name) {
+				return '<option value="' + name.replace(/"/g, '&quot;') + '">' + name + '</option>';
+			}).join('');
+
+			if (previousValue && functionNames.indexOf(previousValue) !== -1) {
+				functionEl.value = previousValue;
+			} else {
+				functionEl.value = '';
+			}
+		}
+
 		function updatePredictiveStatusFromCurrentView() {
 			var statusEl = document.getElementById('pfStatus');
 			if (!statusEl || !predictiveLastRunMeta) {
 				return;
 			}
+			var filteredRows = getFilteredPredictiveCandidates();
 			var selectedLevels = getTopScoreLevelsValue();
-			var shownRows = Math.min(selectedLevels, predictiveCandidatesAll.length || 0);
+			var shownRows = Math.min(selectedLevels, filteredRows.length || 0);
+			var moduleLabel = String((document.getElementById('pfModuleFilter') || {}).value || '').trim() || 'All';
+			var functionLabel = String((document.getElementById('pfFunctionFilter') || {}).value || '').trim() || 'All';
 			if (predictiveLastRunType === 'e2e') {
-				statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | release: ' + (predictiveLastRunMeta.release_name || 'MSP End-to-End Run') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(predictiveCandidatesAll.length || 0) + ' | Returned Rows: ' + String(shownRows);
+				statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | release: ' + (predictiveLastRunMeta.release_name || 'MSP End-to-End Run') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(filteredRows.length || 0) + ' | Returned Rows: ' + String(shownRows) + ' | Module: ' + moduleLabel + ' | Function: ' + functionLabel;
 				return;
 			}
-			statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | Match mode: ' + (predictiveLastRunMeta.match_mode || 'strict') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(predictiveCandidatesAll.length || 0) + ' | Returned Rows: ' + String(shownRows);
+			statusEl.textContent = 'Completed: ' + (predictiveLastRunMeta.ran_at || 'now') + ' | Match mode: ' + (predictiveLastRunMeta.match_mode || 'strict') + ' | Viewing Levels: ' + String(selectedLevels) + ' | Available Levels: ' + String(filteredRows.length || 0) + ' | Returned Rows: ' + String(shownRows) + ' | Module: ' + moduleLabel + ' | Function: ' + functionLabel;
 		}
 
 		function applyPredictiveTopLevels() {
 			if (!Array.isArray(predictiveCandidatesAll) || !predictiveCandidatesAll.length) {
+				document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows([]);
+				updatePredictiveStatusFromCurrentView();
 				return;
 			}
 			var selectedLevels = getTopScoreLevelsValue();
-			var rowsToRender = predictiveCandidatesAll.slice(0, selectedLevels);
+			var filteredRows = getFilteredPredictiveCandidates();
+			var rowsToRender = filteredRows.slice(0, selectedLevels);
 			document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows(rowsToRender);
 			updatePredictiveStatusFromCurrentView();
 		}
@@ -3482,6 +3580,7 @@ def _ui_html() -> str:
 				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
 				predictiveLastRunMeta = runMeta;
 				predictiveLastRunType = 'default';
+				repopulatePredictiveFilterDropdowns();
 				applyPredictiveTopLevels();
 				var outputs = data.outputs || {};
 				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [outputs.recurrence_csv, outputs.module_summary_csv, outputs.functionality_summary_csv].filter(Boolean).join(' | ');
@@ -3566,6 +3665,7 @@ def _ui_html() -> str:
 				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
 				predictiveLastRunMeta = runMeta;
 				predictiveLastRunType = 'e2e';
+				repopulatePredictiveFilterDropdowns();
 				applyPredictiveTopLevels();
 				var outputs = data.outputs || {};
 				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [
@@ -4428,6 +4528,15 @@ def _ui_html() -> str:
 		});
 
 		document.getElementById('pfTopLevels').addEventListener('input', function() {
+			applyPredictiveTopLevels();
+		});
+
+		document.getElementById('pfModuleFilter').addEventListener('change', function() {
+			repopulatePredictiveFunctionDropdown('');
+			applyPredictiveTopLevels();
+		});
+
+		document.getElementById('pfFunctionFilter').addEventListener('change', function() {
 			applyPredictiveTopLevels();
 		});
 
