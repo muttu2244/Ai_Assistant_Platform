@@ -2793,6 +2793,10 @@ def _ui_html() -> str:
 		.table th{position:sticky;top:0;background:#f7f9ff;color:#4b5f7f;z-index:1;}
 		.row-risk-high{background:#fff1f2;}
 		.row-risk-medium{background:#fff8ef;}
+		.badge-risk{display:inline-flex;align-items:center;padding:2px 7px;border-radius:999px;font-size:11px;font-weight:700;}
+		.badge-risk-high{background:#ffe4e6;color:#b91c1c;border:1px solid #fca5a5;}
+		.badge-risk-medium{background:#fef3c7;color:#92400e;border:1px solid #fcd34d;}
+		.badge-risk-low{background:#dcfce7;color:#166534;border:1px solid #86efac;}
 		.row-risk-low{background:#f4fff8;}
 
 		.result-box{
@@ -3199,7 +3203,7 @@ def _ui_html() -> str:
 								<select id="pfFunctionFilter" style="min-width:220px;"><option value="">All Functions</option></select>
 							</div>
 						</div>
-						<div class="table-wrap"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="9" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
+						<div class="table-wrap"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th><th title="AI model reopen risk score">AI Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="10" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
 					</div>
 
 					<div class="struct-hint" id="pfOutputHint"></div>
@@ -3304,6 +3308,7 @@ def _ui_html() -> str:
 		}
 
 		var predictiveCandidatesAll = [];
+		var predictiveMlScores = {};
 		var predictiveLastRunMeta = null;
 		var predictiveLastRunType = '';
 
@@ -3420,7 +3425,7 @@ def _ui_html() -> str:
 			var showDependencyColumns = shouldShowDependencyColumns(rows);
 			setCandidateDependencyColumnsVisible(showDependencyColumns);
 			if (!Array.isArray(rows) || !rows.length) {
-				return '<tr><td colspan="' + String(showDependencyColumns ? 9 : 7) + '" class="muted">No recurrence candidates found.</td></tr>';
+				return '<tr><td colspan="' + String(showDependencyColumns ? 10 : 8) + '" class="muted">No recurrence candidates found.</td></tr>';
 			}
 			return rows.map(function(item, idx){
 				var risk = String(item.risk_level || 'None');
@@ -3436,7 +3441,24 @@ def _ui_html() -> str:
 					ticketCell += '<div id="' + expandedId + '" style="display:none;margin-top:4px;font-size:11px;color:#51607a;">' + allIds + '</div>';
 				}
 				var relationCell = showDependencyColumns ? '<td><span class="pill">' + (item.relationship_type || '-') + '</span></td><td>' + String(item.dependency_distance || '-') + '</td>' : '';
-				return '<tr class="' + cls + '"><td>' + String(item.impact_score || '-') + '</td><td>' + String(item.ticket_count || 0) + '</td><td>' + ticketCell + '</td>' + relationCell + '<td>' + (item.module_name || '-') + '</td><td>' + (item.modified_functionality || '-') + '</td><td>' + (item.impact_reason || '-') + '</td><td>' + risk + '</td></tr>';
+				var mlScore = predictiveMlScores[String(idx)];
+				var aiRiskCell;
+				if (!mlScore) {
+					aiRiskCell = '<td><span class="muted">-</span></td>';
+				} else {
+					var score = Number(mlScore.risk_score || 0);
+					var pct = Math.round(score * 100);
+					var badgeCls, badgeLabel;
+					if (mlScore.predicted_label === 1) {
+						badgeCls = 'badge-risk-high'; badgeLabel = 'High (' + pct + '%)';
+					} else if (score >= 0.30) {
+						badgeCls = 'badge-risk-medium'; badgeLabel = 'Med (' + pct + '%)';
+					} else {
+						badgeCls = 'badge-risk-low'; badgeLabel = 'Low (' + pct + '%)';
+					}
+					aiRiskCell = '<td><span class="badge-risk ' + badgeCls + '">' + badgeLabel + '</span></td>';
+				}
+				return '<tr class="' + cls + '"><td>' + String(item.impact_score || '-') + '</td><td>' + String(item.ticket_count || 0) + '</td><td>' + ticketCell + '</td>' + relationCell + '<td>' + (item.module_name || '-') + '</td><td>' + (item.modified_functionality || '-') + '</td><td>' + (item.impact_reason || '-') + '</td><td>' + risk + '</td>' + aiRiskCell + '</tr>';
 			}).join('');
 		}
 
@@ -3558,6 +3580,34 @@ def _ui_html() -> str:
 			updatePredictiveStatusFromCurrentView();
 		}
 
+		async function fetchAndMergeMLScores(candidates) {
+			if (!Array.isArray(candidates) || !candidates.length) return;
+			var tickets = candidates.map(function(item, idx) {
+				return {
+					ticket_id: String(idx),
+					module_name: item.module_name || null,
+					modified_functionality: item.modified_functionality || null,
+					customer_priority: (item.risk_level === 'High') ? 'high' : (item.risk_level === 'Medium') ? 'medium' : 'low',
+					work_item_type: 'Bug'
+				};
+			});
+			try {
+				var res = await fetch('/api/predictive/ml-score', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({ tickets: tickets })
+				});
+				if (!res.ok) return;
+				var data = await res.json();
+				var newScores = {};
+				(data.scores || []).forEach(function(s) { newScores[String(s.ticket_id)] = s; });
+				predictiveMlScores = newScores;
+				applyPredictiveTopLevels();
+			} catch (err) {
+				console.warn('ML scoring unavailable:', err);
+			}
+		}
+
 		function toggleTicketIds(containerId, linkEl) {
 			var el = document.getElementById(containerId);
 			if (!el) {
@@ -3634,8 +3684,10 @@ def _ui_html() -> str:
 				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
 				predictiveLastRunMeta = runMeta;
 				predictiveLastRunType = 'default';
+				predictiveMlScores = {};
 				repopulatePredictiveFilterDropdowns();
 				applyPredictiveTopLevels();
+				fetchAndMergeMLScores(predictiveCandidatesAll);
 				var outputs = data.outputs || {};
 				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [outputs.recurrence_csv, outputs.module_summary_csv, outputs.functionality_summary_csv].filter(Boolean).join(' | ');
 			} catch (err) {
@@ -3719,8 +3771,10 @@ def _ui_html() -> str:
 				predictiveCandidatesAll = Array.isArray(data.recurrence_candidates_all) ? data.recurrence_candidates_all : (data.recurrence_candidates || []);
 				predictiveLastRunMeta = runMeta;
 				predictiveLastRunType = 'e2e';
+				predictiveMlScores = {};
 				repopulatePredictiveFilterDropdowns();
 				applyPredictiveTopLevels();
+				fetchAndMergeMLScores(predictiveCandidatesAll);
 				var outputs = data.outputs || {};
 				document.getElementById('pfOutputHint').textContent = 'Output CSVs: ' + [
 					outputs.ticket_export_csv,

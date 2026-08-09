@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>SmartCare QA AI Assistant</title>
+  <link rel="stylesheet" href="/static/css/app.css"/>
+</head>
+<body>
+  <main class="shell">
+    <div class="logo-bar">
+      <img src="/brand-logo" alt="Streamline Healthcare"/>
+    </div>
+
+    <section id="homeView" class="screen active">
+      <article class="card">
+        <div class="home-body">
+          <h2 class="home-title">QA AI Assistant</h2>
+          <p class="home-copy">Welcome to the AI-powered QA Assistant for smarter, faster, and automated QA testing.</p>
+          <div class="mode-switch">
+            <button class="mode-btn active" id="goFreeTextHome" onclick="showView('freetext')">Free Text View</button>
+            <button class="mode-btn" id="goKeywordHome" disabled title="Temporarily disabled">Keyword View</button>
+            <button class="mode-btn" id="goStructuredHome" onclick="showView('structured')">DefectPredictiveAnalysis</button>
+          </div>
+        </div>
+      </article>
+    </section>
+
+    <section id="structuredView" class="screen">
+      <article class="card frame">
+        <div class="bar">
+          <div class="bar-left">
+            <button class="left-link" onclick="showView('home')">&#8249;</button>
+            <span class="muted strong">Home</span>
+          </div>
+          <div class="bar-title">Predictive QA Flow</div>
+          <button class="ghost-btn" disabled title="Temporarily disabled">Keyword View &#8250;</button>
+        </div>
+
+        <div class="panel-grid struct-shell">
+          <div class="struct-grid">
+            <div class="struct-field"><label>Release Name</label><input id="pfRelease" value="MSP Default Run"/></div>
+            <div class="struct-field"><label>Days Window</label><input id="pfDays" type="number" min="1" value="180"/></div>
+            <div class="struct-field"><label>Work Item Scope</label><input id="pfScope" value="Bug,Customer Ticket"/></div>
+            <div class="struct-field"><label>Priority Scope</label><input id="pfPriority" value="On Fire,Urgent,High"/></div>
+            <div class="struct-field"><label>Match Mode</label><select id="pfMatch"><option value="strict" selected>Strict</option><option value="fuzzy">Fuzzy</option></select></div>
+            <div class="struct-field"><label>Include Dependencies</label><select id="pfDeps"><option value="true" selected>Yes</option><option value="false">No</option></select></div>
+            <div class="struct-field"><label>MSP Workbook (.xlsx)</label><input id="pfMspFile" type="file" accept=".xlsx,.xlsm,.xls"/></div>
+            <div class="struct-field"><label>MSP Sheet Name</label><input id="pfMspSheet" value="6.0_1-AprilMSP_2026"/></div>
+            <div class="struct-field"><label>MSP Target Category</label><input id="pfMspCategory" value="Engineering Improvement Initiatives- NBL(I)"/></div>
+            <div class="struct-field"><label>Refresh ADO Export</label><select id="pfRefreshAdo"><option value="true" selected>Yes</option><option value="false">No (use existing CSV)</option></select></div>
+            <div class="struct-field"><label>Apply Query Update</label><select id="pfApplyQuery"><option value="false" selected>No</option><option value="true">Yes</option></select></div>
+            <div class="struct-field"><label>Modified Functions CSV</label><input id="pfModifiedFile" type="file" accept=".csv"/></div>
+            <div class="struct-field"><label>Dependency Metrics CSV</label><input id="pfDependencyFile" type="file" accept=".csv"/></div>
+          </div>
+
+          <div class="struct-actions">
+            <button id="pfRunE2EBtn" class="struct-run" onclick="runPredictiveE2E()">Run End-to-End (MSP - Final)</button>
+            <button id="pfRunBtn" class="struct-run alt" onclick="runPredictiveDefaults()">Run Quick (Existing CSVs)</button>
+            <button class="struct-run alt" onclick="showView('freetext')">Open Chat Assistant</button>
+            <span id="pfStatus" class="struct-hint">Ready. Uses default CSVs if files are not uploaded.</span>
+          </div>
+
+          <div id="pfKpis" class="kpi-grid">
+            <div class="kpi-card"><h4>Total Modules</h4><div class="val" id="kpiModules">-</div></div>
+            <div class="kpi-card"><h4>Functionalities</h4><div class="val" id="kpiFuncs">-</div></div>
+            <div class="kpi-card"><h4>Modified Funcs</h4><div class="val" id="kpiModified">-</div></div>
+            <div class="kpi-card"><h4>Candidate Rows</h4><div class="val" id="kpiCandidates">-</div></div>
+            <div class="kpi-card"><h4>High Risk</h4><div class="val" id="kpiHighRisk">-</div></div>
+          </div>
+
+          <div class="report-grid">
+            <div class="report-box">
+              <p class="report-title">Modules by Tickets (Full List)</p>
+              <div id="pfTopModules"></div>
+            </div>
+            <div class="report-box">
+              <p class="report-title">Functionalities by Tickets (Full List)</p>
+              <div id="pfTopFuncs"></div>
+            </div>
+          </div>
+
+          <div class="report-box">
+            <div class="filter-row">
+              <p class="report-title" id="pfTopScoresTitle">Probable Recurrence Candidates</p>
+              <div class="filter-controls">
+                <label for="pfTopLevels" class="muted strong small">Score Levels</label>
+                <input id="pfTopLevels" type="text" list="pfTopLevelsList" value="50" class="filter-input"/>
+                <datalist id="pfTopLevelsList"><option value="10"></option><option value="25"></option><option value="50"></option><option value="75"></option><option value="100"></option><option value="150"></option><option value="200"></option></datalist>
+                <label for="pfModuleFilter" class="muted strong small">Module</label>
+                <select id="pfModuleFilter" class="filter-select"><option value="">All Modules</option></select>
+                <label for="pfFunctionFilter" class="muted strong small">Function</label>
+                <select id="pfFunctionFilter" class="filter-select function-select"><option value="">All Functions</option></select>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th><th title="AI model reopen risk score">AI Risk</th>
+                  </tr>
+                </thead>
+                <tbody id="pfCandidateRows"><tr><td colspan="10" class="muted">Run the flow to populate results.</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="struct-hint" id="pfOutputHint"></div>
+        </div>
+      </article>
+    </section>
+
+    <section id="keywordView" class="screen">
+      <article class="card frame">
+        <div class="bar">
+          <div class="bar-left">
+            <button class="left-link" onclick="showView('home')">&#8249;</button>
+            <span class="muted strong">Home</span>
+          </div>
+          <div class="bar-title">QA AI Assistant</div>
+          <button class="ghost-btn" onclick="showView('freetext')">Chat View</button>
+        </div>
+        <div class="panel-grid"><div class="muted">Keyword view is temporarily disabled.</div></div>
+      </article>
+    </section>
+
+    <section id="freetextView" class="screen">
+      <article class="chat-shell">
+        <aside class="chat-nav">
+          <div class="chat-search-wrap">
+            <span class="chat-search-icon" aria-hidden="true">&#128269;</span>
+            <input id="chatHistorySearch" class="chat-search-input" type="text" placeholder="Search chats" oninput="renderChatHistory()"/>
+          </div>
+          <button class="new-chat" onclick="startNewChatSession()">+ New QA Chat</button>
+          <div class="chat-section-title">Chat Sessions</div>
+          <div id="chatHistory" class="chat-history"></div>
+          <button class="ghost-btn" onclick="showView('home')">Back to Home</button>
+        </aside>
+
+        <div class="chat-main">
+          <div class="chat-top"><div class="chat-status">Live Assistant</div></div>
+          <div id="chatFeed" class="chat-feed"></div>
+          <div class="chat-input-wrap">
+            <div class="composer">
+              <button id="attachBtn" class="send" type="button" onclick="triggerContextUpload()" title="Attach files">+</button>
+              <input id="contextFileInput" type="file" accept=".txt,.md,.csv,.json,.docx,.pdf" multiple class="hidden" onchange="handleContextFilesSelected(event)"/>
+              <textarea id="chatInput" placeholder="Message QA AI Assistant..."></textarea>
+              <button id="sendBtn" class="send" onclick="sendChat()">Send</button>
+            </div>
+            <div class="attached-row">
+              <div id="attachedFiles" class="muted small flex-1"></div>
+              <button id="clearAttachedBtn" class="ghost-btn hidden small-btn" type="button" onclick="clearAllAttachedFiles()">Clear all</button>
+            </div>
+          </div>
+        </div>
+      </article>
+    </section>
+  </main>
+  <script src="/static/js/app.js"></script>
+</body>
+</html>
