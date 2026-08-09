@@ -1923,6 +1923,60 @@ async def predictive_run_status(run_id: str = Query(...)) -> dict[str, object]:
 	return run
 
 
+@app.post("/api/predictive/ml-score")
+async def ml_score_tickets(request: dict) -> dict:
+	"""Score a batch of tickets using the trained XGBoost model."""
+	from src.chat_ui.schemas import MLScoreRequest, MLScoreResponse, MLTicketScore
+	from src.services.ml_inference_service import get_ml_inference_service
+
+	try:
+		parsed = MLScoreRequest(**request)
+	except Exception as exc:
+		raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+	try:
+		svc = get_ml_inference_service()
+	except FileNotFoundError as exc:
+		raise HTTPException(
+			status_code=503,
+			detail=f"ML model not available: {exc}. Run the offline training script with --save-model first.",
+		) from exc
+	except Exception as exc:
+		raise HTTPException(status_code=500, detail=f"Failed to load ML model: {exc}") from exc
+
+	tickets_dicts = [
+		{
+			"ticket_id": t.ticket_id,
+			"title": t.title,
+			"changed_date": t.changed_date,
+			"module_name": t.module_name,
+			"modified_functionality": t.modified_functionality,
+			"dependent_functionality": t.dependent_functionality,
+			"customer_priority": t.customer_priority,
+			"relationship_type": t.relationship_type,
+			"work_item_type": t.work_item_type,
+			"extra_fields": t.extra_fields,
+		}
+		for t in parsed.tickets
+	]
+
+	try:
+		raw_scores = svc.score_tickets(tickets_dicts, threshold_override=parsed.threshold_override)
+	except Exception as exc:
+		raise HTTPException(status_code=500, detail=f"Scoring failed: {exc}") from exc
+
+	scores = [MLTicketScore(**s) for s in raw_scores]
+	predicted_positive_count = sum(1 for s in scores if s.predicted_label == 1)
+
+	return MLScoreResponse(
+		scores=scores,
+		model_version=scores[0].model_version if scores else "unknown",
+		threshold_used=scores[0].threshold_used if scores else 0.5,
+		total_tickets=len(scores),
+		predicted_positive_count=predicted_positive_count,
+	).model_dump()
+
+
 @app.get("/capabilities")
 async def capabilities() -> dict[str, object]:
 	status = settings.feature_status()
