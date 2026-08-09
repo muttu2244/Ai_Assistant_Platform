@@ -1977,6 +1977,95 @@ async def ml_score_tickets(request: dict) -> dict:
 	).model_dump()
 
 
+@app.post("/api/predictive/ml-score-candidates")
+async def ml_score_candidates(request: dict) -> dict:
+	"""Score candidate groups using individual ticket data from the ADO export CSV.
+
+	Expects: {"candidates": [{"candidate_idx": 0, "ticket_ids": "694923; 701234", "module_name": "...", ...}]}
+	Returns: {"scores": [{"candidate_idx": 0, "max_risk_score": 0.41, "predicted_label": 0, "tickets_scored": 2}]}
+	"""
+	import csv as _csv
+	from src.services.ml_inference_service import get_ml_inference_service
+
+	candidates = request.get("candidates") or []
+	if not candidates:
+		return {"scores": []}
+
+	# Load ticket lookup from CSV (id → row dict)
+	ticket_lookup: dict[str, dict] = {}
+	if DEFAULT_TICKET_EXPORT_CSV.exists():
+		try:
+			with DEFAULT_TICKET_EXPORT_CSV.open(newline="", encoding="utf-8-sig") as f:
+				for row in _csv.DictReader(f):
+					tid = str(row.get("id") or row.get("work_item_id") or "").strip()
+					if tid:
+						ticket_lookup[tid] = row
+		except Exception:
+			pass
+
+	try:
+		svc = get_ml_inference_service()
+	except FileNotFoundError:
+		return {"scores": [], "error": "ML model not available"}
+	except Exception:
+		return {"scores": [], "error": "Failed to load ML model"}
+
+	results = []
+	for cand in candidates:
+		idx = cand.get("candidate_idx", 0)
+		raw_ids = str(cand.get("ticket_ids") or "")
+		ticket_ids = [t.strip() for t in raw_ids.replace(";", ",").split(",") if t.strip()]
+
+		# Build per-ticket inputs from CSV lookup
+		ticket_inputs = []
+		for tid in ticket_ids:
+			row = ticket_lookup.get(tid)
+			if row:
+				ticket_inputs.append({
+					"ticket_id": tid,
+					"title": row.get("title") or row.get("work_item_title") or None,
+					"changed_date": row.get("changed_date") or row.get("created_date") or None,
+					"customer_priority": row.get("customer_priority") or row.get("priority") or None,
+					"work_item_type": row.get("work_item_type") or row.get("type") or None,
+					"module_name": row.get("module") or row.get("module_name") or cand.get("module_name") or None,
+					"modified_functionality": cand.get("modified_functionality") or None,
+				})
+
+		# Fallback to aggregate candidate data if no tickets found in CSV
+		if not ticket_inputs:
+			ticket_inputs = [{
+				"ticket_id": str(idx),
+				"module_name": cand.get("module_name") or None,
+				"modified_functionality": cand.get("modified_functionality") or None,
+				"customer_priority": cand.get("customer_priority") or None,
+				"work_item_type": "Bug",
+			}]
+
+		try:
+			scored = svc.score_tickets(ticket_inputs)
+			max_score = max(s["risk_score"] for s in scored)
+			threshold = scored[0]["threshold_used"] if scored else 0.42
+			results.append({
+				"candidate_idx": idx,
+				"max_risk_score": round(max_score, 6),
+				"predicted_label": int(max_score >= threshold),
+				"threshold_used": threshold,
+				"model_version": scored[0]["model_version"] if scored else "unknown",
+				"tickets_scored": len(ticket_inputs),
+			})
+		except Exception:
+			results.append({
+				"candidate_idx": idx,
+				"max_risk_score": 0.0,
+				"predicted_label": 0,
+				"threshold_used": 0.42,
+				"model_version": "unknown",
+				"tickets_scored": 0,
+			})
+
+	return {"scores": results}
+
+
 @app.get("/capabilities")
 async def capabilities() -> dict[str, object]:
 	status = settings.feature_status()
@@ -2769,17 +2858,19 @@ def _ui_html() -> str:
 		.struct-field input:focus,.struct-field select:focus{outline:none;border-color:#9eb8ea;box-shadow:0 0 0 3px rgba(31,111,235,0.10);}
 		.struct-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
 		.struct-run{border:none;border-radius:10px;padding:11px 18px;font-weight:700;font-size:14px;color:#fff;background:linear-gradient(120deg,#0ca06f,#0d7f5a);cursor:pointer;}
-		.struct-run.alt{background:linear-gradient(120deg,#6c1f99,#5a1884);}
+		.struct-run.alt{background:linear-gradient(120deg,#0ea5e9,#2563eb);}
+		.struct-run.chat{background:linear-gradient(120deg,#f59e0b,#d97706);}
 		.struct-hint{font-size:12px;color:#677a95;}
-		.kpi-grid{display:grid;grid-template-columns:repeat(5,minmax(150px,1fr));gap:12px;}
+		.kpi-grid{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:12px;}
 		.kpi-card{border-radius:12px;padding:12px 14px;color:#fff;box-shadow:0 8px 18px rgba(20,34,58,0.15);}
 		.kpi-card h4{margin:0;font-size:12px;text-transform:uppercase;letter-spacing:0.5px;opacity:0.9;}
 		.kpi-card .val{margin-top:6px;font-size:26px;font-weight:800;line-height:1;}
 		.kpi-a{background:linear-gradient(120deg,#2b6df5,#1949ba);}
 		.kpi-b{background:linear-gradient(120deg,#00a88f,#0a7f6d);}
-		.kpi-c{background:linear-gradient(120deg,#ff8c42,#f05c42);}
-		.kpi-d{background:linear-gradient(120deg,#8a5bd4,#6630ad);}
-		.kpi-e{background:linear-gradient(120deg,#f857a6,#c83a8a);}
+		.kpi-c{background:linear-gradient(120deg,#4caf50,#2e7d32);}
+		.kpi-d{background:linear-gradient(120deg,#ffc107,#ff9800);}
+		.kpi-e{background:linear-gradient(120deg,#ff5252,#c41c3b);}
+		.kpi-f{background:linear-gradient(120deg,#ff6b6b,#ee5a52);}
 		.report-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
 		.report-box{border:1px solid var(--line);border-radius:12px;background:#fff;padding:12px;}
 		.report-title{margin:0 0 8px;font-size:13px;font-weight:700;color:#4a5f7e;text-transform:uppercase;letter-spacing:0.4px;}
@@ -3167,16 +3258,17 @@ def _ui_html() -> str:
 					<div class="struct-actions">
 						<button id="pfRunE2EBtn" class="struct-run" onclick="runPredictiveE2E()">Run End-to-End (MSP -> Final)</button>
 						<button id="pfRunBtn" class="struct-run alt" onclick="runPredictiveDefaults()">Run Quick (Existing CSVs)</button>
-						<button class="struct-run alt" onclick="showView('freetext')">Open Chat Assistant</button>
+						<button class="struct-run chat" onclick="showView('freetext')">Open Chat Assistant</button>
 						<span id="pfStatus" class="struct-hint">Ready. Uses default CSVs if files are not uploaded.</span>
 					</div>
 
 					<div id="pfKpis" class="kpi-grid">
 						<div class="kpi-card kpi-a"><h4>Total Modules</h4><div class="val" id="kpiModules">-</div></div>
 						<div class="kpi-card kpi-b"><h4>Functionalities</h4><div class="val" id="kpiFuncs">-</div></div>
-						<div class="kpi-card kpi-c"><h4>Modified Funcs</h4><div class="val" id="kpiModified">-</div></div>
-						<div class="kpi-card kpi-d"><h4>Candidate Rows</h4><div class="val" id="kpiCandidates">-</div></div>
+						<div class="kpi-card kpi-c"><h4>Low Risk</h4><div class="val" id="kpiLowRisk">-</div></div>
+						<div class="kpi-card kpi-d"><h4>Medium Risk</h4><div class="val" id="kpiMediumRisk">-</div></div>
 						<div class="kpi-card kpi-e"><h4>High Risk</h4><div class="val" id="kpiHighRisk">-</div></div>
+						<div class="kpi-card kpi-f"><h4>Total Tickets</h4><div class="val" id="kpiTotalTickets">-</div></div>
 					</div>
 
 					<div class="report-grid">
@@ -3570,6 +3662,10 @@ def _ui_html() -> str:
 		function applyPredictiveTopLevels() {
 			if (!Array.isArray(predictiveCandidatesAll) || !predictiveCandidatesAll.length) {
 				document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows([]);
+				document.getElementById('kpiTotalTickets').textContent = '0';
+				document.getElementById('kpiLowRisk').textContent = '0';
+				document.getElementById('kpiMediumRisk').textContent = '0';
+				document.getElementById('kpiHighRisk').textContent = '0';
 				updatePredictiveStatusFromCurrentView();
 				return;
 			}
@@ -3577,31 +3673,82 @@ def _ui_html() -> str:
 			var filteredRows = getFilteredPredictiveCandidates();
 			var rowsToRender = filteredRows.slice(0, selectedLevels);
 			document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows(rowsToRender);
+			
+			var totalTickets = 0, lowRiskTickets = 0, mediumRiskTickets = 0, highRiskTickets = 0;
+			rowsToRender.forEach(function(row) {
+				var ticketCount = Number(row.ticket_count || 0);
+				totalTickets += ticketCount;
+				
+				// Find the index of this row in predictiveCandidatesAll to get ML scores
+				var candidateIdx = predictiveCandidatesAll.indexOf(row);
+				if (candidateIdx >= 0 && predictiveMlScores[String(candidateIdx)]) {
+					var score = Number(predictiveMlScores[String(candidateIdx)].risk_score || 0);
+					var label = Number(predictiveMlScores[String(candidateIdx)].predicted_label || 0);
+					if (label === 1) {
+						highRiskTickets += ticketCount;
+					} else if (score >= 0.30 && score < 0.42) {
+						mediumRiskTickets += ticketCount;
+					} else if (score < 0.30) {
+						lowRiskTickets += ticketCount;
+					}
+				}
+			});
+			
+			document.getElementById('kpiTotalTickets').textContent = String(totalTickets);
+			document.getElementById('kpiLowRisk').textContent = String(lowRiskTickets);
+			document.getElementById('kpiMediumRisk').textContent = String(mediumRiskTickets);
+			document.getElementById('kpiHighRisk').textContent = String(highRiskTickets);
 			updatePredictiveStatusFromCurrentView();
 		}
 
 		async function fetchAndMergeMLScores(candidates) {
 			if (!Array.isArray(candidates) || !candidates.length) return;
-			var tickets = candidates.map(function(item, idx) {
+			var payload = candidates.map(function(item, idx) {
 				return {
-					ticket_id: String(idx),
+					candidate_idx: idx,
+					ticket_ids: String(item.ticket_ids_all || item.ticket_ids_preview || ''),
 					module_name: item.module_name || null,
 					modified_functionality: item.modified_functionality || null,
-					customer_priority: (item.risk_level === 'High') ? 'high' : (item.risk_level === 'Medium') ? 'medium' : 'low',
-					work_item_type: 'Bug'
+					customer_priority: (item.risk_level === 'High') ? 'high' : (item.risk_level === 'Medium') ? 'medium' : 'low'
 				};
 			});
 			try {
-				var res = await fetch('/api/predictive/ml-score', {
+				var res = await fetch('/api/predictive/ml-score-candidates', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ tickets: tickets })
+					body: JSON.stringify({ candidates: payload })
 				});
 				if (!res.ok) return;
 				var data = await res.json();
 				var newScores = {};
-				(data.scores || []).forEach(function(s) { newScores[String(s.ticket_id)] = s; });
+				(data.scores || []).forEach(function(s) {
+					newScores[String(s.candidate_idx)] = {
+						risk_score: s.max_risk_score,
+						predicted_label: s.predicted_label,
+						threshold_used: s.threshold_used,
+						model_version: s.model_version
+					};
+				});
 				predictiveMlScores = newScores;
+				var lowRiskTickets = 0, mediumRiskTickets = 0, highRiskTickets = 0;
+				Object.keys(newScores).forEach(function(key) {
+					var idx = parseInt(key);
+					var candidate = predictiveCandidatesAll[idx];
+					if (!candidate) return;
+					var ticketCount = Number(candidate.ticket_count || 0);
+					var score = Number(newScores[key].risk_score || 0);
+					var label = Number(newScores[key].predicted_label || 0);
+					if (label === 1) {
+						highRiskTickets += ticketCount;
+					} else if (score >= 0.30 && score < 0.42) {
+						mediumRiskTickets += ticketCount;
+					} else if (score < 0.30) {
+						lowRiskTickets += ticketCount;
+					}
+				});
+				document.getElementById('kpiLowRisk').textContent = String(lowRiskTickets);
+				document.getElementById('kpiMediumRisk').textContent = String(mediumRiskTickets);
+				document.getElementById('kpiHighRisk').textContent = String(highRiskTickets);
 				applyPredictiveTopLevels();
 			} catch (err) {
 				console.warn('ML scoring unavailable:', err);
@@ -3672,9 +3819,7 @@ def _ui_html() -> str:
 				var cards = data.cards || {};
 				document.getElementById('kpiModules').textContent = String(cards.total_modules || 0);
 				document.getElementById('kpiFuncs').textContent = String(cards.total_functionalities || 0);
-				document.getElementById('kpiModified').textContent = String(cards.total_modified_functions || 0);
-				document.getElementById('kpiCandidates').textContent = String(cards.candidate_rows || 0);
-				document.getElementById('kpiHighRisk').textContent = String(cards.high_risk_rows || 0);
+			document.getElementById('kpiLowRisk').textContent = '0';
 
 				document.getElementById('pfTopModules').innerHTML = renderModuleBars(data.top_modules || []);
 				document.getElementById('pfTopFuncs').innerHTML = renderFuncBars(data.top_functionalities || []);
@@ -3759,9 +3904,10 @@ def _ui_html() -> str:
 				var cards = data.cards || {};
 				document.getElementById('kpiModules').textContent = String(cards.total_modules || 0);
 				document.getElementById('kpiFuncs').textContent = String(cards.total_functionalities || 0);
-				document.getElementById('kpiModified').textContent = String(cards.total_modified_functions || 0);
-				document.getElementById('kpiCandidates').textContent = String(cards.candidate_rows || 0);
+				document.getElementById('kpiLowRisk').textContent = '0';
+				document.getElementById('kpiMediumRisk').textContent = '0';
 				document.getElementById('kpiHighRisk').textContent = String(cards.high_risk_rows || 0);
+				document.getElementById('kpiTotalTickets').textContent = '0';
 
 				document.getElementById('pfTopModules').innerHTML = renderModuleBars(data.top_modules || []);
 				document.getElementById('pfTopFuncs').innerHTML = renderFuncBars(data.top_functionalities || []);
