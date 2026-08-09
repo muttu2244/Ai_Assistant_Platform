@@ -24,6 +24,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+try:
+    import joblib as _joblib  # optional – only needed for --save-model
+except ImportError:  # pragma: no cover
+    _joblib = None  # type: ignore[assignment]
+
 
 def _require_dependencies() -> tuple[object, object, object, object, object, object, object]:
     try:
@@ -787,6 +792,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--random-state", type=int, default=42, help="Random seed")
     parser.add_argument("--output-dir", default="artifacts/offline_model_compare", help="Output directory")
+    parser.add_argument(
+        "--save-model",
+        action="store_true",
+        help="Serialize the trained XGBoost model and metadata to the output directory (requires joblib).",
+    )
     return parser
 
 
@@ -1402,6 +1412,29 @@ def main() -> int:
         f"- Threshold Search CSV: {threshold_search_csv}",
     ])
     summary_md.write_text("\n".join(md), encoding="utf-8")
+
+    if args.save_model:
+        if _joblib is None:
+            print("WARNING: --save-model requires joblib; skipping model save.", file=sys.stderr)
+        else:
+            model_joblib_path = output_dir / "model.joblib"
+            model_metadata_path = output_dir / "model_metadata.json"
+            _joblib.dump(model, model_joblib_path)
+            model_metadata = {
+                "model_version": datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"),
+                "threshold": float(xgb_threshold),
+                "feature_columns": list(X_model.columns),
+                "feature_engineering_enabled": bool(args.enable_feature_engineering),
+                "engineered_feature_names": list(engineered_feature_names),
+                "roc_auc": float(xgb_eval.roc_auc),
+                "pr_auc": float(xgb_eval.pr_auc),
+                "training_rows": int(len(fit_idx)),
+                "label_column": str(label_col),
+            }
+            with model_metadata_path.open("w", encoding="utf-8") as mf:
+                json.dump(model_metadata, mf, indent=2)
+            print(f"Model saved: {model_joblib_path}")
+            print(f"Metadata saved: {model_metadata_path}")
 
     print("Offline comparison completed.")
     print(f"Metrics JSON: {metrics_json}")
