@@ -2645,7 +2645,7 @@ def _ui_html() -> str:
 			min-height:100vh;
 		}
 
-		.shell{max-width:1180px;margin:0 auto;padding:34px 20px 90px;}
+		.shell{max-width:1400px;margin:0 auto;padding:34px 20px 90px;}
 		.screen{display:none;}
 		.screen.active{display:block;}
 
@@ -2720,7 +2720,7 @@ def _ui_html() -> str:
 		.mode-switch{
 			margin:30px auto 0;
 			display:inline-grid;
-			grid-template-columns:1fr 1fr;
+			grid-template-columns:1fr 1fr 1fr;
 			background:var(--panel-soft);
 			border:1px solid var(--line);
 			border-radius:12px;
@@ -2858,6 +2858,7 @@ def _ui_html() -> str:
 		.struct-field input:focus,.struct-field select:focus{outline:none;border-color:#9eb8ea;box-shadow:0 0 0 3px rgba(31,111,235,0.10);}
 		.struct-actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}
 		.struct-run{border:none;border-radius:10px;padding:11px 18px;font-weight:700;font-size:14px;color:#fff;background:linear-gradient(120deg,#0ca06f,#0d7f5a);cursor:pointer;}
+		.struct-run:disabled{background:linear-gradient(120deg,#b0bec5,#90a4ae);cursor:not-allowed;opacity:0.6;}
 		.struct-run.alt{background:linear-gradient(120deg,#0ea5e9,#2563eb);}
 		.struct-run.chat{background:linear-gradient(120deg,#f59e0b,#d97706);}
 		.struct-hint{font-size:12px;color:#677a95;}
@@ -2879,6 +2880,7 @@ def _ui_html() -> str:
 		.bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#2b6df5,#7a46c5);}
 		.pill{display:inline-flex;align-items:center;padding:3px 8px;border-radius:999px;font-size:11px;font-weight:700;border:1px solid #d8c8ef;background:#f7efff;color:#5e2d87;}
 		.table-wrap{max-height:280px;overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fff;}
+		.table-wrap-full{overflow:auto;border:1px solid var(--line);border-radius:10px;background:#fff;}
 		.table{width:100%;border-collapse:collapse;font-size:12px;}
 		.table th,.table td{border-bottom:1px solid #edf1f9;padding:8px 9px;vertical-align:top;text-align:left;}
 		.table th{position:sticky;top:0;background:#f7f9ff;color:#4b5f7f;z-index:1;}
@@ -3217,7 +3219,7 @@ def _ui_html() -> str:
 					<div class="mode-switch">
 						<button class="mode-btn active" id="goFreeTextHome" onclick="showView('freetext')">Free Text View</button>
 						<button class="mode-btn" id="goKeywordHome" disabled style="opacity:0.55;cursor:not-allowed;" title="Temporarily disabled">Keyword View</button>
-						<button class="mode-btn" id="goStructuredHome" onclick="showView('structured')">DefectPredictiveAnalysis</button>
+						<button class="mode-btn" id="goStructuredHome" onclick="showView('structured')">Defect Predictive Analysis</button>
 					</div>
 
 					<div class="hero-art">
@@ -3293,9 +3295,19 @@ def _ui_html() -> str:
 								<select id="pfModuleFilter" style="min-width:170px;"><option value="">All Modules</option></select>
 								<label for="pfFunctionFilter" class="muted" style="font-size:12px;font-weight:700;margin-left:8px;">Function</label>
 								<select id="pfFunctionFilter" style="min-width:220px;"><option value="">All Functions</option></select>
+								<label for="pfAiRiskFilter" class="muted" style="font-size:12px;font-weight:700;margin-left:8px;">AI Risk</label>
+								<select id="pfAiRiskFilter" style="min-width:120px;"><option value="">All</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
 							</div>
 						</div>
-						<div class="table-wrap"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th>Risk</th><th title="AI model reopen risk score">AI Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="10" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
+						<div class="table-wrap-full"><table class="table"><thead><tr><th>Score</th><th>Tickets</th><th>Ticket IDs</th><th id="pfCandidateRelationshipHead">Relationship</th><th id="pfCandidateHopHead">Dependency Hop</th><th>Module</th><th>Modified Function</th><th>Reason</th><th style="display:none">Risk</th><th title="AI model reopen risk score">AI Risk</th></tr></thead><tbody id="pfCandidateRows"><tr><td colspan="10" class="muted">Run the flow to populate results.</td></tr></tbody></table></div>
+						<div id="pfPagination" style="display:none;align-items:center;justify-content:space-between;margin-top:10px;gap:8px;flex-wrap:wrap;">
+							<button id="pfPagePrev" class="struct-run" style="padding:6px 14px;font-size:13px;" onclick="changePredictivePage(-1)" disabled>&#8249; Prev</button>
+							<span id="pfPageInfo" class="muted" style="font-size:13px;font-weight:600;"></span>
+							<button id="pfPageNext" class="struct-run" style="padding:6px 14px;font-size:13px;" onclick="changePredictivePage(1)">Next &#8250;</button>
+						</div>
+						<div style="margin-top:10px;text-align:right;">
+							<button class="struct-run" style="padding:6px 16px;font-size:13px;background:linear-gradient(120deg,#0ca06f,#0d7f5a);" onclick="downloadCandidatesCSV()">&#8595; Download CSV</button>
+						</div>
 					</div>
 
 					<div class="struct-hint" id="pfOutputHint"></div>
@@ -3403,6 +3415,8 @@ def _ui_html() -> str:
 		var predictiveMlScores = {};
 		var predictiveLastRunMeta = null;
 		var predictiveLastRunType = '';
+		var predictiveCurrentPage = 0;
+		var predictivePageSize = 10;
 
 		function getTopScoreLevelsValue() {
 			var raw = String((document.getElementById('pfTopLevels') || {}).value || '50').trim();
@@ -3533,7 +3547,8 @@ def _ui_html() -> str:
 					ticketCell += '<div id="' + expandedId + '" style="display:none;margin-top:4px;font-size:11px;color:#51607a;">' + allIds + '</div>';
 				}
 				var relationCell = showDependencyColumns ? '<td><span class="pill">' + (item.relationship_type || '-') + '</span></td><td>' + String(item.dependency_distance || '-') + '</td>' : '';
-				var mlScore = predictiveMlScores[String(idx)];
+				var originalIdx = predictiveCandidatesAll.indexOf(item);
+				var mlScore = predictiveMlScores[String(originalIdx)];
 				var aiRiskCell;
 				if (!mlScore) {
 					aiRiskCell = '<td><span class="muted">-</span></td>';
@@ -3542,24 +3557,26 @@ def _ui_html() -> str:
 					var pct = Math.round(score * 100);
 					var badgeCls, badgeLabel;
 					if (mlScore.predicted_label === 1) {
-						badgeCls = 'badge-risk-high'; badgeLabel = 'High (' + pct + '%)';
+						badgeCls = 'badge-risk-high'; badgeLabel = 'High';
 					} else if (score >= 0.30) {
-						badgeCls = 'badge-risk-medium'; badgeLabel = 'Med (' + pct + '%)';
+						badgeCls = 'badge-risk-medium'; badgeLabel = 'Med';
 					} else {
-						badgeCls = 'badge-risk-low'; badgeLabel = 'Low (' + pct + '%)';
+						badgeCls = 'badge-risk-low'; badgeLabel = 'Low';
 					}
 					aiRiskCell = '<td><span class="badge-risk ' + badgeCls + '">' + badgeLabel + '</span></td>';
 				}
-				return '<tr class="' + cls + '"><td>' + String(item.impact_score || '-') + '</td><td>' + String(item.ticket_count || 0) + '</td><td>' + ticketCell + '</td>' + relationCell + '<td>' + (item.module_name || '-') + '</td><td>' + (item.modified_functionality || '-') + '</td><td>' + (item.impact_reason || '-') + '</td><td>' + risk + '</td>' + aiRiskCell + '</tr>';
+				return '<tr class="' + cls + '"><td>' + String(item.impact_score || '-') + '</td><td>' + String(item.ticket_count || 0) + '</td><td>' + ticketCell + '</td>' + relationCell + '<td>' + (item.module_name || '-') + '</td><td>' + (item.modified_functionality || '-') + '</td><td>' + (item.impact_reason || '-') + '</td><td style="display:none">' + risk + '</td>' + aiRiskCell + '</tr>';
 			}).join('');
 		}
 
 		function getPredictiveFilterValues() {
 			var moduleFilter = String((document.getElementById('pfModuleFilter') || {}).value || '').trim().toLowerCase();
 			var functionFilter = String((document.getElementById('pfFunctionFilter') || {}).value || '').trim().toLowerCase();
+			var aiRiskFilter = String((document.getElementById('pfAiRiskFilter') || {}).value || '').trim().toLowerCase();
 			return {
 				moduleFilter: moduleFilter,
 				functionFilter: functionFilter,
+				aiRiskFilter: aiRiskFilter,
 			};
 		}
 
@@ -3568,7 +3585,7 @@ def _ui_html() -> str:
 				return [];
 			}
 			var filters = getPredictiveFilterValues();
-			return predictiveCandidatesAll.filter(function(item) {
+			return predictiveCandidatesAll.filter(function(item, idx) {
 				var moduleName = String(item.module_name || '').trim().toLowerCase();
 				var modifiedFunction = String(item.modified_functionality || '').trim().toLowerCase();
 				if (filters.moduleFilter && moduleName !== filters.moduleFilter) {
@@ -3576,6 +3593,17 @@ def _ui_html() -> str:
 				}
 				if (filters.functionFilter && modifiedFunction !== filters.functionFilter) {
 					return false;
+				}
+				if (filters.aiRiskFilter) {
+					var mlScore = predictiveMlScores[String(idx)];
+					var aiRiskLevel = 'low';
+					if (mlScore) {
+						var score = Number(mlScore.risk_score || 0);
+						var label = Number(mlScore.predicted_label || 0);
+						if (label === 1) { aiRiskLevel = 'high'; }
+						else if (score >= 0.30) { aiRiskLevel = 'medium'; }
+					}
+					if (aiRiskLevel !== filters.aiRiskFilter) { return false; }
 				}
 				return true;
 			});
@@ -3666,20 +3694,37 @@ def _ui_html() -> str:
 				document.getElementById('kpiLowRisk').textContent = '0';
 				document.getElementById('kpiMediumRisk').textContent = '0';
 				document.getElementById('kpiHighRisk').textContent = '0';
+				document.getElementById('pfPagination').style.display = 'none';
 				updatePredictiveStatusFromCurrentView();
 				return;
 			}
 			var selectedLevels = getTopScoreLevelsValue();
 			var filteredRows = getFilteredPredictiveCandidates();
 			var rowsToRender = filteredRows.slice(0, selectedLevels);
-			document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows(rowsToRender);
-			
+
+			// Pagination
+			var totalRows = rowsToRender.length;
+			var totalPages = Math.max(1, Math.ceil(totalRows / predictivePageSize));
+			if (predictiveCurrentPage >= totalPages) { predictiveCurrentPage = totalPages - 1; }
+			if (predictiveCurrentPage < 0) { predictiveCurrentPage = 0; }
+			var pageStart = predictiveCurrentPage * predictivePageSize;
+			var pageEnd = Math.min(pageStart + predictivePageSize, totalRows);
+			var pageRows = rowsToRender.slice(pageStart, pageEnd);
+
+			document.getElementById('pfCandidateRows').innerHTML = renderCandidateRows(pageRows);
+
+			// Pagination controls
+			var paginationEl = document.getElementById('pfPagination');
+			paginationEl.style.display = totalRows > predictivePageSize ? 'flex' : 'none';
+			document.getElementById('pfPageInfo').textContent = 'Page ' + (predictiveCurrentPage + 1) + ' of ' + totalPages + '  (' + totalRows + ' rows)';
+			document.getElementById('pfPagePrev').disabled = predictiveCurrentPage === 0;
+			document.getElementById('pfPageNext').disabled = predictiveCurrentPage >= totalPages - 1;
+
+			// KPI calculations across ALL filtered rows (not just current page)
 			var totalTickets = 0, lowRiskTickets = 0, mediumRiskTickets = 0, highRiskTickets = 0;
 			rowsToRender.forEach(function(row) {
 				var ticketCount = Number(row.ticket_count || 0);
 				totalTickets += ticketCount;
-				
-				// Find the index of this row in predictiveCandidatesAll to get ML scores
 				var candidateIdx = predictiveCandidatesAll.indexOf(row);
 				if (candidateIdx >= 0 && predictiveMlScores[String(candidateIdx)]) {
 					var score = Number(predictiveMlScores[String(candidateIdx)].risk_score || 0);
@@ -3693,12 +3738,54 @@ def _ui_html() -> str:
 					}
 				}
 			});
-			
 			document.getElementById('kpiTotalTickets').textContent = String(totalTickets);
 			document.getElementById('kpiLowRisk').textContent = String(lowRiskTickets);
 			document.getElementById('kpiMediumRisk').textContent = String(mediumRiskTickets);
 			document.getElementById('kpiHighRisk').textContent = String(highRiskTickets);
 			updatePredictiveStatusFromCurrentView();
+		}
+
+		function changePredictivePage(delta) {
+			predictiveCurrentPage += delta;
+			applyPredictiveTopLevels();
+		}
+
+		function downloadCandidatesCSV() {
+			var selectedLevels = getTopScoreLevelsValue();
+			var filteredRows = getFilteredPredictiveCandidates().slice(0, selectedLevels);
+			if (!filteredRows.length) { return; }
+			var headers = ['Score','Tickets','Ticket IDs','Module','Modified Function','Relationship','Dependency Hop','Reason','AI Risk'];
+			var lines = [headers.join(',')];
+			filteredRows.forEach(function(row) {
+				var originalIdx = predictiveCandidatesAll.indexOf(row);
+				var mlScore = predictiveMlScores[String(originalIdx)];
+				var aiRisk = '-';
+				if (mlScore) {
+					var score = Number(mlScore.risk_score || 0);
+					aiRisk = mlScore.predicted_label === 1 ? 'High' : (score >= 0.30 ? 'Med' : 'Low');
+				}
+				var cols = [
+					row.impact_score || '',
+					row.ticket_count || '',
+					'"' + (row.ticket_ids_all || row.ticket_ids_preview || '').replace(/"/g, '""') + '"',
+					'"' + (row.module_name || '').replace(/"/g, '""') + '"',
+					'"' + (row.modified_functionality || '').replace(/"/g, '""') + '"',
+					row.relationship_type || '',
+					row.dependency_distance || '',
+					'"' + (row.impact_reason || '').replace(/"/g, '""') + '"',
+					aiRisk
+				];
+				lines.push(cols.join(','));
+			});
+			var blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+			var url = URL.createObjectURL(blob);
+			var a = document.createElement('a');
+			a.href = url;
+			a.download = 'recurrence_candidates_summary.csv';
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
 		}
 
 		async function fetchAndMergeMLScores(candidates) {
@@ -4786,11 +4873,18 @@ def _ui_html() -> str:
 		});
 
 		document.getElementById('pfModuleFilter').addEventListener('change', function() {
+			predictiveCurrentPage = 0;
 			repopulatePredictiveFunctionDropdown('');
 			applyPredictiveTopLevels();
 		});
 
 		document.getElementById('pfFunctionFilter').addEventListener('change', function() {
+			predictiveCurrentPage = 0;
+			applyPredictiveTopLevels();
+		});
+
+		document.getElementById('pfAiRiskFilter').addEventListener('change', function() {
+			predictiveCurrentPage = 0;
 			applyPredictiveTopLevels();
 		});
 
