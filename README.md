@@ -1,5 +1,7 @@
 # Introduction 
-TODO: Give a short introduction of your project. Let this section explain the objectives or the motivation behind this project. 
+AI Assistant Platform is a modular FastAPI-based AI engineering intelligence system that unifies ADO work-item ingestion, predictive risk scoring, and context-grounded workflow automation. It uses a layered architecture (routes/services/repositories), ML-powered prioritization, and orchestrated E2E pipelines (MSP mapping, ADO export, recurrence analysis), delivered through API-first services and an interactive operations UI with real-time filtering, KPIs, pagination, and export capabilities.
+
+
 
 # Getting Started
 TODO: Guide users through getting your code up and running on their own system. In this section you can talk about:
